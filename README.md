@@ -121,6 +121,10 @@ a plain folder with one stubborn human and too many markdown files.
 py -m unittest discover -s tests -v
 ```
 
+## Version
+
+Current release: 0.0.2. See [CHANGELOG.md](CHANGELOG.md).
+
 ## Core behavior
 
 - Complete the requested work first.

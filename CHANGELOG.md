@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.0.2 - 2026-08-07
+
+- Added SAIPEN Core maintenance state (`.saipen/`, gitignored) and gitignore entries.
+- Added README version line.
+
 ## 0.0.1 - 2026-08-07
 
 - Initial release of SAITALK as a standalone repository.
