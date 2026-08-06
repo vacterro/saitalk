@@ -13,6 +13,7 @@ SENTINEL = "<SAITALK-CONTRACT>"
 CONTRACT_PATTERN = re.compile(r"(?m)^contract_id\s*[:=]\s*(\S+)\s*$")
 CONF_PATTERN = re.compile(r"(?m)^([a-z_]+)=(\S.*|\S*)$")
 STATE_PATTERN = re.compile(r"(?m)^saitalk_contract:\s*(\S+)\s*$")
+STATE_STATUS_PATTERN = re.compile(r"(?m)^saitalk_status:\s*(\S+)\s*$")
 
 ALLOWED = {
     "spec_version": {"1"},
@@ -169,6 +170,11 @@ def validate_state(path: Path, expected: str) -> None:
     if actual != expected:
         raise SaitalkError(
             f"saitalk_contract: found {actual!r}, expected {expected!r}"
+        )
+    status_match = STATE_STATUS_PATTERN.search(text)
+    if status_match is not None and status_match.group(1) != "active":
+        raise SaitalkError(
+            f"saitalk_status: found {status_match.group(1)!r}, expected 'active'"
         )
 
 

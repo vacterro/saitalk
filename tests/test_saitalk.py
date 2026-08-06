@@ -74,6 +74,29 @@ class SaitalkTests(unittest.TestCase):
             with self.assertRaises(module.SaitalkError):
                 module.validate_state(state, "saitalk-12345678")
 
+    def test_inactive_status_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            state = root / "STATE.md"
+            state.write_text(
+                "saitalk_contract: saitalk-12345678\n"
+                "saitalk_status: inactive\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(module.SaitalkError):
+                module.validate_state(state, "saitalk-12345678")
+
+    def test_active_status_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            state = root / "STATE.md"
+            state.write_text(
+                "saitalk_contract: saitalk-12345678\n"
+                "saitalk_status: active\n",
+                encoding="utf-8",
+            )
+            module.validate_state(state, "saitalk-12345678")
+
 
 if __name__ == "__main__":
     unittest.main()

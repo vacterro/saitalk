@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.0.3 - 2026-08-07
+
+- Validator now enforces `saitalk_status: active` in bound state files when the field is present.
+- Added tests for inactive-status failure and active-status pass.
+
 ## 0.0.2 - 2026-08-07
 
 - Added SAIPEN Core maintenance state (`.saipen/`, gitignored) and gitignore entries.
