@@ -10,7 +10,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
-from scripts import saitalk  # noqa: E402
+from scripts import saitalk
 
 CONF_FMT = (
     "spec_version=2\n"
@@ -42,6 +42,7 @@ def run_cli(*args: str, cwd: Path | None = None) -> subprocess.CompletedProcess[
         text=True,
         cwd=cwd or REPO,
         timeout=60,
+        check=False,
     )
 
 
@@ -98,23 +99,25 @@ class ConfigTests(unittest.TestCase):
             "-1": "response_budget must be between 1 and 20",
         }
         for budget, expected in cases.items():
-            with self.subTest(budget=budget):
-                with tempfile.TemporaryDirectory() as temp:
-                    root = Path(temp)
-                    contract, conf, skill = make_root(root)
-                    conf.write_text(
-                        conf.read_text().replace(
-                            "response_budget=5", f"response_budget={budget}"
-                        ),
-                        encoding="utf-8",
-                    )
-                    if expected is None:
-                        saitalk.refresh(contract, conf, skill)
+            with (
+                self.subTest(budget=budget),
+                tempfile.TemporaryDirectory() as temp,
+            ):
+                root = Path(temp)
+                contract, conf, skill = make_root(root)
+                conf.write_text(
+                    conf.read_text().replace(
+                        "response_budget=5", f"response_budget={budget}"
+                    ),
+                    encoding="utf-8",
+                )
+                if expected is None:
+                    saitalk.refresh(contract, conf, skill)
+                    saitalk.validate(contract, conf, skill)
+                else:
+                    with self.assertRaises(saitalk.SaitalkError) as ctx:
                         saitalk.validate(contract, conf, skill)
-                    else:
-                        with self.assertRaises(saitalk.SaitalkError) as ctx:
-                            saitalk.validate(contract, conf, skill)
-                        self.assertIn(expected, str(ctx.exception))
+                    self.assertIn(expected, str(ctx.exception))
 
     def test_response_budget_non_integer_fails(self) -> None:
         self.conf.write_text(
@@ -129,18 +132,20 @@ class ConfigTests(unittest.TestCase):
 
     def test_every_invalid_language_fails(self) -> None:
         for lang in ("fr", "de", "eesti", "日本語", ""):
-            with self.subTest(lang=lang):
-                with tempfile.TemporaryDirectory() as temp:
-                    root = Path(temp)
-                    contract, conf, skill = make_root(root)
-                    conf.write_text(
-                        conf.read_text().replace(
-                            "reply_language=en", f"reply_language={lang}"
-                        ),
-                        encoding="utf-8",
-                    )
-                    with self.assertRaises(saitalk.SaitalkError):
-                        saitalk.validate(contract, conf, skill)
+            with (
+                self.subTest(lang=lang),
+                tempfile.TemporaryDirectory() as temp,
+            ):
+                root = Path(temp)
+                contract, conf, skill = make_root(root)
+                conf.write_text(
+                    conf.read_text().replace(
+                        "reply_language=en", f"reply_language={lang}"
+                    ),
+                    encoding="utf-8",
+                )
+                with self.assertRaises(saitalk.SaitalkError):
+                    saitalk.validate(contract, conf, skill)
 
     def test_crlf_normalization_does_not_break_marker(self) -> None:
         expected = saitalk.refresh(self.contract, self.conf, self.skill)
@@ -287,7 +292,7 @@ class RefreshTests(unittest.TestCase):
     def test_reject_identical_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            contract, conf, skill = make_root(root)
+            contract, _, skill = make_root(root)
             with self.assertRaises(saitalk.SaitalkError) as ctx:
                 saitalk.refresh(contract, contract, skill)
             self.assertIn("same file", str(ctx.exception))
@@ -322,9 +327,10 @@ class RefreshTests(unittest.TestCase):
             contract, conf, skill = make_root(root)
             before_c = self._bytes(contract)
             before_f = self._bytes(conf)
-            with unittest.mock.patch(patch_target, side_effect=failer):
-                with self.assertRaises(saitalk.SaitalkError):
-                    saitalk.refresh(contract, conf, skill)
+            with unittest.mock.patch(patch_target, side_effect=failer), self.assertRaises(
+                saitalk.SaitalkError
+            ):
+                saitalk.refresh(contract, conf, skill)
             self.assertEqual(self._bytes(contract), before_c)
             self.assertEqual(self._bytes(conf), before_f)
             self.assertFalse((root / "SAITALK.md.tmp").exists())
@@ -345,9 +351,8 @@ class RefreshTests(unittest.TestCase):
             contract, conf, skill = make_root(root)
             with unittest.mock.patch(
                 "scripts.saitalk._write_temp", side_effect=self._fail_write(1)
-            ):
-                with self.assertRaises(saitalk.SaitalkError):
-                    saitalk.refresh(contract, conf, skill)
+            ), self.assertRaises(saitalk.SaitalkError):
+                saitalk.refresh(contract, conf, skill)
             expected = saitalk.refresh(contract, conf, skill)
             actual, _ = saitalk.validate(contract, conf, skill)
             self.assertEqual(actual, expected)
@@ -463,6 +468,14 @@ class CanonicalSuiteTests(unittest.TestCase):
     def test_package_validates(self) -> None:
         proc = run_cli("validate")
         self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_version_sources_agree(self) -> None:
+        version = (REPO / "VERSION").read_text(encoding="utf-8").strip()
+        self.assertRegex(version, r"^\d+\.\d+\.\d+$")
+        readme = (REPO / "README.md").read_text(encoding="utf-8")
+        self.assertIn(f"Current release: {version}.", readme)
+        changelog = (REPO / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertIn(f"## {version} - ", changelog)
 
 
 class EvalHarnessTests(unittest.TestCase):

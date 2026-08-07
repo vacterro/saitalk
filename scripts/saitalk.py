@@ -12,9 +12,9 @@ import tempfile
 from pathlib import Path
 
 if os.name == "nt":
-    import msvcrt  # noqa: F401  (Windows lock primitives)
+    import msvcrt  # Windows lock primitives
 else:
-    import fcntl  # noqa: F401  (POSIX lock primitives)
+    import fcntl  # POSIX lock primitives
 
 SENTINEL = "<SAITALK-CONTRACT>"
 DIGEST_HEX = 16
@@ -79,9 +79,7 @@ def read_text(path: Path) -> str:
         raise SaitalkError(f"permission denied: {path}") from exc
     except UnicodeDecodeError as exc:
         raise SaitalkError(f"not UTF-8: {path}") from exc
-    if text.startswith("\ufeff"):
-        text = text[1:]
-    return text
+    return text.removeprefix("\ufeff")
 
 
 def normalize(text: str) -> str:
@@ -278,8 +276,6 @@ def refresh(contract_path: Path, conf_path: Path, skill_path: Path) -> str:
             manifest["saitalk.conf"], new_id, "saitalk.conf contract_id"
         )
 
-        original_contract = manifest["SAITALK.md"]
-        original_conf = manifest["saitalk.conf"]
         original_bytes = {
             contract_path: contract_path.read_bytes(),
             conf_path: conf_path.read_bytes(),

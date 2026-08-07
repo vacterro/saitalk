@@ -46,15 +46,17 @@ def validate_cases(data: dict[str, Any]) -> None:
         seen.add(cid)
         for field in REQUIRED_FIELDS:
             value = case.get(field)
-            if field in ("setup", "prompt") and not isinstance(value, str):
-                raise EvalError(f"case {cid}: {field} must be a non-empty string")
-            if field in ("must", "must_not"):
-                if not isinstance(value, list) or not value or not all(
-                    isinstance(item, str) and item for item in value
-                ):
-                    raise EvalError(
-                        f"case {cid}: {field} must be a non-empty list of strings"
-                    )
+            if field in ("setup", "prompt"):
+                if not isinstance(value, str) or not value:
+                    raise EvalError(f"case {cid}: {field} must be a non-empty string")
+            elif (
+                not isinstance(value, list)
+                or not value
+                or not all(isinstance(item, str) and item for item in value)
+            ):
+                raise EvalError(
+                    f"case {cid}: {field} must be a non-empty list of strings"
+                )
 
 
 def export_cases(data: dict[str, Any]) -> str:

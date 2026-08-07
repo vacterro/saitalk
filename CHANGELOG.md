@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.1.8 - 2026-08-07
+
+Correction of a false release claim. The 0.0.4 entry stated that dead config
+keys were "removed"; they were not removed, only documented. This entry states
+what actually happened to each key:
+
+- `spec_version` — retained, bumped `1` -> `2` for the language/style schema
+  migration (0.1.0). Fixed conformance declaration.
+- `reply_language` — retained, became the sole chat-language selector
+  (0.1.0). Operator-controlled setting.
+- `chat_style` — retained, value migrated from `caveman-ded-en` to
+  `caveman-ded`; legacy value is rejected with one exact repair instruction
+  (0.1.0). Fixed conformance declaration.
+- `artifact_language` — retained and given executable semantics via
+  `resolve_artifact_language()` (0.1.4). Operator-controlled setting.
+- `review_mode` — retained. Fixed conformance declaration.
+- `response_budget` — retained and validated (boundaries 1-20, integer-only).
+  Operator-controlled setting.
+- `contract_id` — retained; runtime seal extended over SAITALK.md, saitalk.conf
+  and SKILL.md, digest suffix 8 -> 16 hex (0.1.2). Derived field.
+
+Other migrations in this release wave:
+
+- State schema: `saitalk_status` plus new `saitalk_voice` field, each required
+  exactly once; status only `active`, voice `active` or `suspended`;
+  standalone-only voice commands (0.1.3).
+- Authority: six-level conflict-resolution ladder; completion-first gate with
+  a decision table; SAITALK.md is the single normative behavior source, SKILL
+  shortened to mechanics, adapters transport-only (0.1.1).
+- Refresh is now transactional with byte-exact rollback (0.1.5).
+- Tests expanded from 5 to 42 across config, state, seal, refresh, CLI and
+  eval classes (0.1.6, 0.1.7).
+- Eval status: harness is executable and the corpus is schema-valid, but no
+  model run was performed in this wave; results are recorded `NOT_RUN`, not
+  `PASS`.
+
 ## 0.1.7 - 2026-08-07
 
 - Evals became an honest, executable harness (`evals/harness.py`): schema

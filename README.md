@@ -38,6 +38,7 @@ SAITALK/
 ├── examples/
 │   └── STATE.md
 ├── CHANGELOG.md
+├── VERSION
 └── LICENSE
 ```
 
@@ -142,7 +143,7 @@ unrun cases stay `NOT_RUN`. See [evals/README.md](evals/README.md).
 
 ## Version
 
-Current release: 0.1.7. See [CHANGELOG.md](CHANGELOG.md).
+Current release: 0.1.8. See [CHANGELOG.md](CHANGELOG.md).
 
 ## Core behavior
 
