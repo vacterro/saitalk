@@ -5,9 +5,16 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import re
 import sys
+import tempfile
 from pathlib import Path
+
+if os.name == "nt":
+    import msvcrt  # noqa: F401  (Windows lock primitives)
+else:
+    import fcntl  # noqa: F401  (POSIX lock primitives)
 
 SENTINEL = "<SAITALK-CONTRACT>"
 DIGEST_HEX = 16
@@ -63,9 +70,13 @@ class SaitalkError(RuntimeError):
 
 def read_text(path: Path) -> str:
     try:
+        if path.is_dir():
+            raise SaitalkError(f"path is a directory: {path}")
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError as exc:
         raise SaitalkError(f"missing file: {path}") from exc
+    except PermissionError as exc:
+        raise SaitalkError(f"permission denied: {path}") from exc
     except UnicodeDecodeError as exc:
         raise SaitalkError(f"not UTF-8: {path}") from exc
     if text.startswith("\ufeff"):
@@ -168,23 +179,135 @@ def replace_current_id(text: str, new_id: str, label: str) -> str:
     return normalized[:start] + new_id + normalized[end:]
 
 
+def _acquire_lock(target: Path):
+    digest = hashlib.sha256(str(target.resolve()).encode("utf-8")).hexdigest()[:16]
+    lock_path = Path(tempfile.gettempdir()) / f"saitalk-{digest}.lock"
+    try:
+        fh = lock_path.open("a+b")
+    except OSError as exc:
+        raise SaitalkError(f"cannot open lock file {lock_path}: {exc}") from exc
+    try:
+        if os.name == "nt":
+            fh.seek(0)
+            fh.write(b"\0")
+            fh.flush()
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        fh.close()
+        raise SaitalkError(
+            f"lock contention on {target}: another refresh is in progress"
+        ) from exc
+    return fh
+
+
+def _release_lock(fh) -> None:
+    try:
+        if os.name == "nt":
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+    fh.close()
+
+
+def _write_temp(target: Path, content: str) -> Path:
+    tmp = target.with_name(target.name + ".tmp")
+    try:
+        with tmp.open("w", encoding="utf-8", newline="\n") as fh:
+            fh.write(content)
+            fh.flush()
+            os.fsync(fh.fileno())
+    except OSError as exc:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise SaitalkError(f"write failure: {tmp}: {exc}") from exc
+    return tmp
+
+
+def _replace_temp(target: Path, tmp: Path) -> None:
+    try:
+        os.replace(tmp, target)
+    except OSError as exc:
+        raise SaitalkError(f"replacement failure: {target}: {exc}") from exc
+
+
+def _restore_bytes(target: Path, original: bytes) -> None:
+    try:
+        tmp = target.with_name(target.name + ".restore.tmp")
+        with tmp.open("wb") as fh:
+            fh.write(original)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, target)
+    except OSError as exc:
+        raise SaitalkError(f"restore failure on {target}: {exc}") from exc
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def refresh(contract_path: Path, conf_path: Path, skill_path: Path) -> str:
-    manifest = read_manifest(contract_path, conf_path, skill_path)
-    parse_conf(manifest["saitalk.conf"])
+    if contract_path.resolve() == conf_path.resolve():
+        raise SaitalkError(
+            "contract and config paths resolve to the same file"
+        )
 
-    new_id = expected_id(manifest)
+    first = read_manifest(contract_path, conf_path, skill_path)
+    parse_conf(first["saitalk.conf"])
+    expected_id(first)
 
-    contract_path.write_text(
-        replace_current_id(manifest["SAITALK.md"], new_id, "SAITALK.md contract_id"),
-        encoding="utf-8",
-        newline="\n",
-    )
-    conf_path.write_text(
-        replace_current_id(manifest["saitalk.conf"], new_id, "saitalk.conf contract_id"),
-        encoding="utf-8",
-        newline="\n",
-    )
-    return new_id
+    lock = _acquire_lock(contract_path)
+    try:
+        manifest = read_manifest(contract_path, conf_path, skill_path)
+        parse_conf(manifest["saitalk.conf"])
+
+        new_id = expected_id(manifest)
+        new_contract = replace_current_id(
+            manifest["SAITALK.md"], new_id, "SAITALK.md contract_id"
+        )
+        new_conf = replace_current_id(
+            manifest["saitalk.conf"], new_id, "saitalk.conf contract_id"
+        )
+
+        original_contract = manifest["SAITALK.md"]
+        original_conf = manifest["saitalk.conf"]
+        original_bytes = {
+            contract_path: contract_path.read_bytes(),
+            conf_path: conf_path.read_bytes(),
+        }
+
+        pairs = (
+            (contract_path, new_contract, original_bytes[contract_path]),
+            (conf_path, new_conf, original_bytes[conf_path]),
+        )
+        temps: dict[Path, Path] = {}
+        try:
+            for target, content, _ in pairs:
+                temps[target] = _write_temp(target, content)
+            for target, tmp in temps.items():
+                _replace_temp(target, tmp)
+        except SaitalkError:
+            for target, _, original in pairs:
+                _restore_bytes(target, original)
+            raise
+        finally:
+            for tmp in temps.values():
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        return new_id
+    finally:
+        _release_lock(lock)
 
 
 def validate(contract_path: Path, conf_path: Path, skill_path: Path) -> tuple[str, dict[str, str]]:

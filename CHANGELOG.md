@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.5 - 2026-08-07
+
+- `refresh` is now transactional: cross-platform process lock, sibling temp
+  files with flush+fsync, atomic `os.replace`, and byte-exact restoration of
+  both originals if any write or replacement fails. No partial package is
+  left behind. Identical contract/config paths are rejected.
+- All expected filesystem failures (missing file, path is a directory,
+  permission denied, invalid UTF-8, write failure, replacement failure, lock
+  contention) now raise a clean `SaitalkError` with no raw traceback.
+- Added rollback, concurrent-refresh, and same-path red controls to the test
+  suite.
+
 ## 0.1.4 - 2026-08-07
 
 - `artifact_language` now has executable semantics:

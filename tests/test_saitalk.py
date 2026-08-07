@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
@@ -196,6 +197,133 @@ class SaitalkTests(unittest.TestCase):
         self.assertEqual(r("auto", existing_language="de"), "en")
         self.assertEqual(r("en", task_language="de"), "en")
         self.assertEqual(r("ru", existing_language=None, repo_language=None), "ru")
+
+    def _bytes(self, path: Path) -> bytes:
+        return path.read_bytes()
+
+    def test_refresh_rejects_identical_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            contract, conf, skill = self.create_files(root)
+            with self.assertRaises(saitalk.SaitalkError) as ctx:
+                saitalk.refresh(contract, contract, skill)
+            self.assertIn("same file", str(ctx.exception))
+
+    def _fail_write(self, fail_at: int):
+        original = saitalk._write_temp
+        calls = {"n": 0}
+
+        def wrapper(target, content):
+            calls["n"] += 1
+            if calls["n"] == fail_at:
+                raise saitalk.SaitalkError("simulated write failure")
+            return original(target, content)
+
+        return wrapper
+
+    def _fail_replace(self, fail_at: int):
+        original = saitalk._replace_temp
+        calls = {"n": 0}
+
+        def wrapper(target, tmp):
+            calls["n"] += 1
+            if calls["n"] == fail_at:
+                raise saitalk.SaitalkError("simulated replacement failure")
+            return original(target, tmp)
+
+        return wrapper
+
+    def test_refresh_rolls_back_on_first_write_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            contract, conf, skill = self.create_files(root)
+            before_c = self._bytes(contract)
+            before_f = self._bytes(conf)
+            with unittest.mock.patch("test_saitalk.saitalk._write_temp",
+                                     side_effect=self._fail_write(1)):
+                with self.assertRaises(saitalk.SaitalkError):
+                    saitalk.refresh(contract, conf, skill)
+            self.assertEqual(self._bytes(contract), before_c)
+            self.assertEqual(self._bytes(conf), before_f)
+            self.assertFalse((root / "SAITALK.md.tmp").exists())
+            self.assertFalse((root / "saitalk.conf.tmp").exists())
+
+    def test_refresh_rolls_back_on_second_write_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            contract, conf, skill = self.create_files(root)
+            before_c = self._bytes(contract)
+            before_f = self._bytes(conf)
+            with unittest.mock.patch("test_saitalk.saitalk._write_temp",
+                                     side_effect=self._fail_write(2)):
+                with self.assertRaises(saitalk.SaitalkError):
+                    saitalk.refresh(contract, conf, skill)
+            self.assertEqual(self._bytes(contract), before_c)
+            self.assertEqual(self._bytes(conf), before_f)
+            self.assertFalse((root / "SAITALK.md.tmp").exists())
+            self.assertFalse((root / "saitalk.conf.tmp").exists())
+
+    def test_refresh_rolls_back_on_replacement_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            contract, conf, skill = self.create_files(root)
+            before_c = self._bytes(contract)
+            before_f = self._bytes(conf)
+            with unittest.mock.patch("test_saitalk.saitalk._replace_temp",
+                                     side_effect=self._fail_replace(2)):
+                with self.assertRaises(saitalk.SaitalkError):
+                    saitalk.refresh(contract, conf, skill)
+            self.assertEqual(self._bytes(contract), before_c)
+            self.assertEqual(self._bytes(conf), before_f)
+            self.assertFalse((root / "SAITALK.md.tmp").exists())
+            self.assertFalse((root / "saitalk.conf.tmp").exists())
+
+    def test_refresh_success_after_rollback_leaves_valid_package(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            contract, conf, skill = self.create_files(root)
+            with unittest.mock.patch("test_saitalk.saitalk._write_temp",
+                                     side_effect=self._fail_write(1)):
+                with self.assertRaises(saitalk.SaitalkError):
+                    saitalk.refresh(contract, conf, skill)
+            expected = saitalk.refresh(contract, conf, skill)
+            actual, config = saitalk.validate(contract, conf, skill)
+            self.assertEqual(actual, expected)
+            self.assertEqual(config["reply_language"], "en")
+
+    def test_concurrent_refresh_lock_contention(self) -> None:
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            contract, conf, skill = self.create_files(root)
+            holder = saitalk._acquire_lock(contract)
+            try:
+                code = (
+                    "import sys; sys.path.insert(0, %r); import saitalk\n"
+                    "from pathlib import Path\n"
+                    "try:\n"
+                    "    saitalk.refresh(Path(%r), Path(%r), Path(%r))\n"
+                    "    print('NO-LOCK'); sys.exit(1)\n"
+                    "except saitalk.SaitalkError as exc:\n"
+                    "    print('LOCK:' + str(exc)); sys.exit(0)\n"
+                ) % (
+                    str(SCRIPTS),
+                    str(contract),
+                    str(conf),
+                    str(skill),
+                )
+                proc = subprocess.run(
+                    [sys.executable, "-c", code],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+            finally:
+                saitalk._release_lock(holder)
+            self.assertIn("LOCK:", proc.stdout)
+            self.assertIn("lock contention", proc.stdout)
+            self.assertEqual(proc.returncode, 0)
 
     def _lang_conf(self, language: str) -> str:
         return (
