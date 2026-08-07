@@ -169,6 +169,34 @@ class SaitalkTests(unittest.TestCase):
         self.assertIsNone(saitalk.voice_command("stop caveman please"))
         self.assertIsNone(saitalk.voice_command("resume caveman now"))
 
+    def test_artifact_language_fixed_precedence(self) -> None:
+        r = saitalk.resolve_artifact_language
+        self.assertEqual(r("en"), "en")
+        self.assertEqual(r("en", task_language="ru"), "ru")
+        self.assertEqual(r("en", existing_language="et"), "et")
+        self.assertEqual(r("en", repo_language="ru"), "ru")
+        self.assertEqual(r("en", task_language="ru", existing_language="et"), "ru")
+        self.assertEqual(r("en", existing_language="et", repo_language="ru"), "et")
+        self.assertEqual(
+            r("en", task_language="ru", existing_language="et", repo_language="ru"),
+            "ru",
+        )
+
+    def test_artifact_language_auto_cascade(self) -> None:
+        r = saitalk.resolve_artifact_language
+        self.assertEqual(r("auto"), "en")
+        self.assertEqual(r("auto", existing_language="et"), "et")
+        self.assertEqual(r("auto", existing_language="et", task_language="ru"), "et")
+        self.assertEqual(r("auto", task_language="ru"), "ru")
+        self.assertEqual(r("auto", repo_language="ru"), "ru")
+        self.assertEqual(r("auto", task_language="ru", repo_language="et"), "ru")
+
+    def test_artifact_language_ignores_non_languages(self) -> None:
+        r = saitalk.resolve_artifact_language
+        self.assertEqual(r("auto", existing_language="de"), "en")
+        self.assertEqual(r("en", task_language="de"), "en")
+        self.assertEqual(r("ru", existing_language=None, repo_language=None), "ru")
+
     def _lang_conf(self, language: str) -> str:
         return (
             "spec_version=2\n"

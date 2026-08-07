@@ -246,6 +246,38 @@ def validate_state(path: Path, expected: str) -> None:
         )
 
 
+LANGUAGES = frozenset({"en", "et", "ru"})
+
+
+def resolve_artifact_language(
+    configured: str,
+    task_language: str | None = None,
+    existing_language: str | None = None,
+    repo_language: str | None = None,
+) -> str:
+    """Resolve the effective artifact prose language.
+
+    Precedence for a fixed configured value (en/et/ru):
+    1. explicit language required by the current artifact task;
+    2. existing artifact language when editing;
+    3. repository-local artifact language contract;
+    4. configured `artifact_language`;
+    5. English fallback.
+
+    For `auto`: existing artifact language > explicit task language >
+    repository documentation language > English.
+    """
+    if configured == "auto":
+        for candidate in (existing_language, task_language, repo_language):
+            if candidate in LANGUAGES:
+                return candidate
+        return "en"
+    for candidate in (task_language, existing_language, repo_language):
+        if candidate in LANGUAGES:
+            return candidate
+    return configured
+
+
 def validate_drift(root: Path) -> None:
     transport_dir = root / "adapters"
     if not transport_dir.is_dir():
@@ -322,7 +354,8 @@ def main() -> int:
         print(
             f"SAITALK PASS: contract_id={contract_id}; "
             f"reply_language={config['reply_language']}; "
-            f"chat_style={config['chat_style']}{state}"
+            f"chat_style={config['chat_style']}; "
+            f"artifact_language={config['artifact_language']}{state}"
         )
         return 0
     except SaitalkError as exc:

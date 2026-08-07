@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.4 - 2026-08-07
+
+- `artifact_language` now has executable semantics:
+  `resolve_artifact_language()` implements exact precedence (task-required
+  language > existing artifact language > repository-local artifact contract >
+  configured `artifact_language` > English fallback; `auto` cascades existing >
+  task > repository documentation > English).
+- Every config key is now classified in SAITALK.md §12 as operator-controlled
+  setting, fixed conformance declaration, or derived field.
+- Validator output now reports `artifact_language`.
+- All contract markers refreshed.
+
 ## 0.1.3 - 2026-08-07
 
 - Real state machine: bound state now requires exactly one occurrence of each
