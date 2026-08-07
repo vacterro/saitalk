@@ -84,7 +84,8 @@ ru
 auto
 ```
 
-Refresh the contract marker after any config or contract edit:
+Refresh the contract marker after editing any runtime-manifest member
+(`SAITALK.md`, `saitalk.conf`, or `SKILL.md`):
 
 ```powershell
 py scripts/saitalk.py refresh
@@ -143,7 +144,12 @@ unrun cases stay `NOT_RUN`. See [evals/README.md](evals/README.md).
 
 ## Version
 
-Current release: 0.1.8. See [CHANGELOG.md](CHANGELOG.md).
+Current release: 0.1.9. This is the version this working tree declares:
+VERSION, README, and CHANGELOG agree (enforced by the test suite). Shipping
+it also means tagging this exact commit `v0.1.9`; the test suite verifies a
+matching tag when one exists but does not require one, so a declared version
+is not by itself a claim that this tree is tagged. See
+[CHANGELOG.md](CHANGELOG.md).
 
 ## Core behavior
 
@@ -154,7 +160,8 @@ Current release: 0.1.8. See [CHANGELOG.md](CHANGELOG.md).
 - Ship and default to the `caveman-ded` voice with `reply_language=en`.
 - Keep chat compressed.
 - Keep persona out of reusable artifacts.
-- Persist until explicit suspension.
+- Persist across compaction, task switch, and handoff; only the chat voice
+  may be suspended (SAITALK.md §11).
 
 ## License
 

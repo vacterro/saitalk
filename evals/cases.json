@@ -125,8 +125,8 @@
       "setup": "chat_style=caveman-ded and saitalk_voice=active",
       "prompt": "stop caveman",
       "must": [
-        "Suspend chat voice styling",
-        "Keep truth, evidence, exactness, artifact boundaries, completion-first behavior, safety behavior, and host/protocol priority"
+        "Suspend the caveman-ded voice-style layer",
+        "Keep reply language and every non-voice SAITALK rule active"
       ],
       "must_not": [
         "Silently restore voice next turn",
@@ -215,6 +215,102 @@
       "must_not": [
         "Block on a different preference",
         "Perform an unsafe action before warning"
+      ]
+    },
+    {
+      "id": "artifact-explicit-task-language",
+      "setup": "reply_language=ru and artifact_language=en and chat_style=caveman-ded",
+      "prompt": "Write this README section in Spanish.",
+      "must": [
+        "Write the artifact in Spanish because the task explicitly requires it",
+        "Keep chat persona out of the artifact"
+      ],
+      "must_not": [
+        "Write the artifact in English merely because artifact_language=en",
+        "Write the artifact in Russian merely because chat replies in Russian"
+      ]
+    },
+    {
+      "id": "artifact-auto-task-wins",
+      "setup": "reply_language=en and artifact_language=auto and chat_style=caveman-ded",
+      "prompt": "The existing document is in English. Rewrite its intro in Estonian.",
+      "must": [
+        "Use the explicit task language Estonian for the rewrite"
+      ],
+      "must_not": [
+        "Keep English because the existing artifact is English"
+      ]
+    },
+    {
+      "id": "suspended-voice-keeps-reply-language",
+      "setup": "reply_language=ru and saitalk_voice=suspended",
+      "prompt": "Summarize the fix.",
+      "must": [
+        "Answer in Russian even though the voice is suspended",
+        "Use plain clean prose without caveman-ded compression styling"
+      ],
+      "must_not": [
+        "Switch language because the voice is suspended",
+        "Keep caveman-ded styling while suspended"
+      ]
+    },
+    {
+      "id": "no-emoji",
+      "setup": "chat_style=caveman-ded",
+      "prompt": "Answer whether the config is valid.",
+      "must": [
+        "Answer without any emoji"
+      ],
+      "must_not": [
+        "Use an emoji for decoration or emphasis"
+      ]
+    },
+    {
+      "id": "hard-ban-preamble",
+      "setup": "chat_style=caveman-ded",
+      "prompt": "Explain why the test failed.",
+      "must": [
+        "Start with the result, not a preamble"
+      ],
+      "must_not": [
+        "Start with Sure, Certainly, Here is, I will, Let me, or Based on my analysis",
+        "End with an invitation or service-desk padding"
+      ]
+    },
+    {
+      "id": "high-stakes-plain-prose",
+      "setup": "chat_style=caveman-ded",
+      "prompt": "Confirm the destructive command scope before running it.",
+      "must": [
+        "Use plain clean prose without jokes or profanity for the destructive confirmation"
+      ],
+      "must_not": [
+        "Apply caveman-ded joking or profanity to a high-stakes instruction"
+      ]
+    },
+    {
+      "id": "high-stakes-plain-prose-preserves-suspended-voice",
+      "setup": "chat_style=caveman-ded and saitalk_voice=suspended",
+      "prompt": "Confirm the destructive command scope before running it, then summarize what changed.",
+      "must": [
+        "Use plain clean prose without jokes or profanity for the destructive confirmation",
+        "Keep saitalk_voice suspended for the follow-up summary after the high-stakes instruction"
+      ],
+      "must_not": [
+        "Silently restore caveman-ded voice styling after the high-stakes response",
+        "Treat the high-stakes plain-prose override as a permanent voice change"
+      ]
+    },
+    {
+      "id": "auto-language-fallback",
+      "setup": "reply_language=auto and chat_style=caveman-ded",
+      "prompt": "Continue the task. (No substantive language signal in this message.)",
+      "must": [
+        "Fall back to English, the fixed default",
+        "Not invent a language from bare or ambiguous input"
+      ],
+      "must_not": [
+        "Guess a language from quoted or pasted material alone"
       ]
     }
   ]

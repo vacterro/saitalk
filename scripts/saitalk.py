@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import itertools
 import os
 import re
 import sys
@@ -18,13 +19,34 @@ else:
 
 SENTINEL = "<SAITALK-CONTRACT>"
 DIGEST_HEX = 16
+BOM = b"\xef\xbb\xbf"
 RUNTIME_MANIFEST = ("SAITALK.md", "saitalk.conf", "SKILL.md")
 CONTRACT_ID_FILES = frozenset({"SAITALK.md", "saitalk.conf"})
 CONTRACT_PATTERN = re.compile(r"(?m)^contract_id\s*[:=]\s*(\S+)\s*$")
+CONTRACT_ID_BYTES_PATTERN = re.compile(rb"(?m)^contract_id\s*[:=]\s*([^\r\n\s]+)")
 CONF_PATTERN = re.compile(r"(?m)^([a-z_]+)=(\S.*)$")
 STATE_PATTERN = re.compile(r"(?m)^saitalk_contract:\s*(\S+)\s*$")
 STATE_STATUS_PATTERN = re.compile(r"(?m)^saitalk_status:\s*(\S+)\s*$")
 STATE_VOICE_PATTERN = re.compile(r"(?m)^saitalk_voice:\s*(\S+)\s*$")
+FENCE_PATTERN = re.compile(r"^(`{3,}|~{3,})")
+TOP_HEADING_PATTERN = re.compile(r"(?m)^## (.+)$")
+SECTION_PATTERN = re.compile(r"(?m)^## (\d+)\. ")
+CANONICAL_SECTIONS = (
+    "Language",
+    "Voice",
+    "Authority",
+    "Hard bans",
+    "Completion-first rule",
+    "Evidence gate",
+    "Review discipline",
+    "Exactness",
+    "Surfaces",
+    "Persistence",
+    "Suspension and bound state",
+    "Configuration reference",
+)
+SECTION_COUNT = len(CANONICAL_SECTIONS)
+LANGUAGE_TAG = re.compile(r"^[a-z]{2,3}(?:-[a-zA-Z0-9]{2,8})*$")
 
 VOICE_STOP = {"stop caveman", "normal mode"}
 VOICE_RESUME = {"resume caveman", "saitalk mode"}
@@ -63,6 +85,18 @@ REQUIRED_KEYS = {
     "contract_id",
 }
 
+ARTIFACT_CONFIG = frozenset({"en", "et", "ru", "auto"})
+
+STATE_TOKENS = (
+    "saitalk_contract",
+    "saitalk_status",
+    "saitalk_voice",
+    "stop caveman",
+    "normal mode",
+    "resume caveman",
+    "saitalk mode",
+)
+
 
 class SaitalkError(RuntimeError):
     pass
@@ -79,11 +113,64 @@ def read_text(path: Path) -> str:
         raise SaitalkError(f"permission denied: {path}") from exc
     except UnicodeDecodeError as exc:
         raise SaitalkError(f"not UTF-8: {path}") from exc
+    except OSError as exc:
+        raise SaitalkError(f"cannot read {path}: {exc}") from exc
     return text.removeprefix("\ufeff")
+
+
+def read_bytes(path: Path) -> bytes:
+    try:
+        if path.is_dir():
+            raise SaitalkError(f"path is a directory: {path}")
+        return path.read_bytes()
+    except FileNotFoundError as exc:
+        raise SaitalkError(f"missing file: {path}") from exc
+    except PermissionError as exc:
+        raise SaitalkError(f"permission denied: {path}") from exc
+    except OSError as exc:
+        raise SaitalkError(f"cannot read {path}: {exc}") from exc
 
 
 def normalize(text: str) -> str:
     return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _top_level_lines(text: str) -> str:
+    """Return only lines outside fenced code blocks (``` or ~~~) and HTML comments.
+
+    Fence close must match the delimiter character that opened it (a ```
+    fence cannot be closed by ~~~ and vice versa). A single-line HTML
+    comment (`<!-- ... -->` fully on one line) is dropped; a multi-line one
+    is dropped until the closing `-->` is seen.
+    """
+    kept: list[str] = []
+    fence_char: str | None = None
+    in_comment = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if in_comment:
+            if "-->" in stripped:
+                in_comment = False
+            continue
+        if fence_char is not None:
+            match = FENCE_PATTERN.match(stripped)
+            if match and match.group(1)[0] == fence_char:
+                fence_char = None
+            continue
+        match = FENCE_PATTERN.match(stripped)
+        if match:
+            fence_char = match.group(1)[0]
+            continue
+        if stripped.startswith("<!--"):
+            if "-->" not in stripped[4:]:
+                in_comment = True
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
+def _top_level_headings(text: str) -> list[str]:
+    return [m.group(1).rstrip() for m in TOP_HEADING_PATTERN.finditer(_top_level_lines(text))]
 
 
 def exactly_one(pattern: re.Pattern[str], text: str, label: str) -> re.Match[str]:
@@ -137,13 +224,48 @@ def parse_conf(text: str) -> dict[str, str]:
     return values
 
 
-def read_manifest(contract_path: Path, conf_path: Path, skill_path: Path) -> dict[str, str]:
-    manifest: dict[str, str] = {}
-    for label, path in (("SAITALK.md", contract_path), ("saitalk.conf", conf_path), ("SKILL.md", skill_path)):
+def _require_coherent_root(contract_path: Path, conf_path: Path, skill_path: Path) -> None:
+    paths = (contract_path, conf_path, skill_path)
+    try:
+        resolved = [path.resolve() for path in paths]
+    except OSError as exc:
+        raise SaitalkError(f"cannot resolve manifest path: {exc}") from exc
+    for a, b in itertools.combinations(resolved, 2):
+        try:
+            if a == b or os.path.samefile(a, b):
+                raise SaitalkError("manifest members alias the same file")
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise SaitalkError(f"cannot compare manifest paths: {exc}") from exc
+    parents = {path.parent for path in resolved}
+    if len(parents) > 1:
+        raise SaitalkError(
+            "manifest members do not form one coherent package root"
+        )
+
+
+def _manifest_members(
+    contract_path: Path, conf_path: Path, skill_path: Path
+) -> tuple[tuple[str, Path], ...]:
+    """Pair each RUNTIME_MANIFEST label with its path, in canonical order.
+
+    RUNTIME_MANIFEST is the single source of manifest membership and order;
+    every caller that needs the (label, path) pairing goes through here.
+    """
+    pairs = tuple(zip(RUNTIME_MANIFEST, (contract_path, conf_path, skill_path)))
+    for label, path in pairs:
         if path.name != label:
             raise SaitalkError(
                 f"manifest member mismatch: expected {label!r}, got {path.name!r}"
             )
+    return pairs
+
+
+def read_manifest(contract_path: Path, conf_path: Path, skill_path: Path) -> dict[str, str]:
+    _require_coherent_root(contract_path, conf_path, skill_path)
+    manifest: dict[str, str] = {}
+    for label, path in _manifest_members(contract_path, conf_path, skill_path):
         manifest[label] = read_text(path)
     return manifest
 
@@ -158,9 +280,10 @@ def replace_contract_value(text: str, label: str) -> str:
 def expected_id(manifest: dict[str, str]) -> str:
     payload = ""
     for member in sorted(manifest):
-        content = manifest[member]
         if member in CONTRACT_ID_FILES:
-            content = replace_contract_value(content, f"{member} contract_id")
+            content = replace_contract_value(manifest[member], f"{member} contract_id")
+        else:
+            content = normalize(manifest[member])
         payload += member + "\n" + content + "\n"
     digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
     return f"saitalk-{digest[:DIGEST_HEX]}"
@@ -170,26 +293,91 @@ def current_contract_id(text: str, label: str) -> str:
     return exactly_one(CONTRACT_PATTERN, normalize(text), label).group(1)
 
 
-def replace_current_id(text: str, new_id: str, label: str) -> str:
-    normalized = normalize(text)
-    match = exactly_one(CONTRACT_PATTERN, normalized, label)
-    start, end = match.span(1)
-    return normalized[:start] + new_id + normalized[end:]
+def replace_id_bytes(data: bytes, new_id: str, label: str) -> bytes:
+    """Replace the single contract_id value in raw bytes, leaving all other
+    bytes untouched.
+
+    BOM-aware: a leading UTF-8 BOM is set aside before matching so a
+    contract_id on the literal first line still anchors correctly (`^` only
+    matches at byte offset 0 or right after a newline; a BOM at offset 0
+    would otherwise shift the first line's true start past what `^` sees),
+    then the BOM is restored on the result.
+    """
+    prefix = BOM if data.startswith(BOM) else b""
+    body = data[len(prefix):]
+    matches = list(CONTRACT_ID_BYTES_PATTERN.finditer(body))
+    if len(matches) != 1:
+        raise SaitalkError(f"{label}: expected exactly one match, found {len(matches)}")
+    match = matches[0]
+    new_body = body[: match.start(1)] + new_id.encode("ascii") + body[match.end(1):]
+    return prefix + new_body
+
+
+def _section_body(text: str, num: int) -> str:
+    lines = _top_level_lines(text).splitlines()
+    start = None
+    end = len(lines)
+    for i, line in enumerate(lines):
+        match = SECTION_PATTERN.match(line)
+        if match and int(match.group(1)) == num:
+            start = i
+        elif match and start is not None:
+            end = i
+            break
+    if start is None:
+        return ""
+    return "\n".join(lines[start:end])
+
+
+def check_structure(contract_text: str, skill_text: str) -> None:
+    """Minimal structural conformance guards for the normative contract.
+
+    This checks shape and invariants, never wording: the canonical 12
+    numbered section headings must appear exactly once, in order, with their
+    exact title text, outside fenced code blocks and HTML comments (so an
+    example or an appended unnumbered section cannot pass as structure); §11
+    still references the bound state fields and voice commands; §12 still
+    documents every required config key; SKILL.md still names SAITALK.md as
+    the sole normative source. It is not a semantic proof.
+    """
+    normalized = normalize(contract_text)
+    headings = _top_level_headings(normalized)
+    expected_headings = [f"{i}. {title}" for i, title in enumerate(CANONICAL_SECTIONS, 1)]
+    if headings != expected_headings:
+        raise SaitalkError(
+            "contract structure: top-level sections must be exactly "
+            f"{expected_headings} in order, found {headings}"
+        )
+    section11 = _section_body(normalized, 11)
+    section12 = _section_body(normalized, 12)
+    for token in STATE_TOKENS:
+        if token not in section11:
+            raise SaitalkError(
+                f"contract structure: section 11 must reference {token!r}"
+            )
+    for key in sorted(REQUIRED_KEYS):
+        if f"`{key}`" not in section12:
+            raise SaitalkError(
+                f"contract structure: section 12 must document config key {key!r}"
+            )
+    if "SAITALK.md" not in skill_text or "owns all normative behavior" not in skill_text:
+        raise SaitalkError(
+            "contract structure: SKILL.md must declare SAITALK.md as the "
+            "sole normative behavior source"
+        )
 
 
 def _acquire_lock(target: Path):
     digest = hashlib.sha256(str(target.resolve()).encode("utf-8")).hexdigest()[:16]
     lock_path = Path(tempfile.gettempdir()) / f"saitalk-{digest}.lock"
     try:
-        fh = lock_path.open("a+b")
+        if os.name == "nt" and (not lock_path.exists() or lock_path.stat().st_size < 1):
+            lock_path.write_bytes(b"\0")
+        fh = lock_path.open("r+b" if os.name == "nt" else "a+b")
     except OSError as exc:
         raise SaitalkError(f"cannot open lock file {lock_path}: {exc}") from exc
     try:
         if os.name == "nt":
-            fh.seek(0)
-            fh.write(b"\0")
-            fh.flush()
-            fh.seek(0)
             msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
         else:
             fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -213,11 +401,30 @@ def _release_lock(fh) -> None:
     fh.close()
 
 
-def _write_temp(target: Path, content: str) -> Path:
+def _acquire_locks(targets: list[Path]) -> list:
+    """Acquire one lock per target in deterministic canonical order."""
+    ordered = sorted((target.resolve() for target in targets), key=str)
+    handles = []
+    try:
+        for target in ordered:
+            handles.append(_acquire_lock(target))
+    except SaitalkError:
+        for fh in reversed(handles):
+            _release_lock(fh)
+        raise
+    return handles
+
+
+def _release_locks(handles) -> None:
+    for fh in reversed(handles):
+        _release_lock(fh)
+
+
+def _write_temp(target: Path, data: bytes) -> Path:
     tmp = target.with_name(target.name + ".tmp")
     try:
-        with tmp.open("w", encoding="utf-8", newline="\n") as fh:
-            fh.write(content)
+        with tmp.open("wb") as fh:
+            fh.write(data)
             fh.flush()
             os.fsync(fh.fileno())
     except OSError as exc:
@@ -254,46 +461,65 @@ def _restore_bytes(target: Path, original: bytes) -> None:
 
 
 def refresh(contract_path: Path, conf_path: Path, skill_path: Path) -> str:
-    if contract_path.resolve() == conf_path.resolve():
-        raise SaitalkError(
-            "contract and config paths resolve to the same file"
-        )
+    """Refresh contract_id from a single authoritative byte snapshot.
 
-    first = read_manifest(contract_path, conf_path, skill_path)
-    parse_conf(first["saitalk.conf"])
-    expected_id(first)
-
-    lock = _acquire_lock(contract_path)
+    Every manifest member (including SKILL.md) is locked before anything is
+    read, and every member is read exactly once, as bytes; both the hash and
+    the byte-level replacement are derived from that one snapshot, so there
+    is no window where a hashed read and a patched read can observe
+    different bytes. Structure is validated against that same snapshot
+    before any write, so a structurally invalid package can never be
+    blessed with a fresh marker. Rollback restores only the targets this
+    call actually replaced.
+    """
+    _require_coherent_root(contract_path, conf_path, skill_path)
+    locks = _acquire_locks([contract_path, conf_path, skill_path])
     try:
-        manifest = read_manifest(contract_path, conf_path, skill_path)
+        raw: dict[str, bytes] = {}
+        for label, path in _manifest_members(contract_path, conf_path, skill_path):
+            raw[label] = read_bytes(path)
+
+        manifest: dict[str, str] = {}
+        for label, data in raw.items():
+            try:
+                manifest[label] = data.decode("utf-8").removeprefix("\ufeff")
+            except UnicodeDecodeError as exc:
+                raise SaitalkError(f"not UTF-8: {label}") from exc
+
         parse_conf(manifest["saitalk.conf"])
-
+        check_structure(manifest["SAITALK.md"], manifest["SKILL.md"])
         new_id = expected_id(manifest)
-        new_contract = replace_current_id(
-            manifest["SAITALK.md"], new_id, "SAITALK.md contract_id"
-        )
-        new_conf = replace_current_id(
-            manifest["saitalk.conf"], new_id, "saitalk.conf contract_id"
-        )
 
-        original_bytes = {
-            contract_path: contract_path.read_bytes(),
-            conf_path: conf_path.read_bytes(),
-        }
+        contract_bytes = raw["SAITALK.md"]
+        conf_bytes = raw["saitalk.conf"]
+        new_contract = replace_id_bytes(contract_bytes, new_id, "SAITALK.md contract_id")
+        new_conf = replace_id_bytes(conf_bytes, new_id, "saitalk.conf contract_id")
 
         pairs = (
-            (contract_path, new_contract, original_bytes[contract_path]),
-            (conf_path, new_conf, original_bytes[conf_path]),
+            (contract_path, new_contract, contract_bytes),
+            (conf_path, new_conf, conf_bytes),
         )
         temps: dict[Path, Path] = {}
+        replaced: list[Path] = []
         try:
-            for target, content, _ in pairs:
+            for target, content, _original in pairs:
                 temps[target] = _write_temp(target, content)
             for target, tmp in temps.items():
                 _replace_temp(target, tmp)
-        except SaitalkError:
-            for target, _, original in pairs:
-                _restore_bytes(target, original)
+                replaced.append(target)
+        except SaitalkError as primary:
+            rollback_failures = []
+            for target, _content, original in pairs:
+                if target not in replaced:
+                    continue
+                try:
+                    _restore_bytes(target, original)
+                except SaitalkError as exc:
+                    rollback_failures.append(f"{target}: {exc}")
+            if rollback_failures:
+                raise SaitalkError(
+                    f"{primary}; rollback incomplete: " + "; ".join(rollback_failures)
+                ) from primary
             raise
         finally:
             for tmp in temps.values():
@@ -303,12 +529,13 @@ def refresh(contract_path: Path, conf_path: Path, skill_path: Path) -> str:
                     pass
         return new_id
     finally:
-        _release_lock(lock)
+        _release_locks(locks)
 
 
 def validate(contract_path: Path, conf_path: Path, skill_path: Path) -> tuple[str, dict[str, str]]:
     manifest = read_manifest(contract_path, conf_path, skill_path)
     config = parse_conf(manifest["saitalk.conf"])
+    check_structure(manifest["SAITALK.md"], manifest["SKILL.md"])
 
     expected = expected_id(manifest)
     contract_current = current_contract_id(manifest["SAITALK.md"], "SAITALK.md contract_id")
@@ -330,24 +557,25 @@ def validate(contract_path: Path, conf_path: Path, skill_path: Path) -> tuple[st
 def voice_command(message: str) -> str | None:
     """Return the target voice state for a standalone voice control command.
 
-    Returns None when the message is not a standalone control phrase. A phrase
-    embedded in quotation, code, a pasted document, an example, or discussion
-    about the command does not change state.
+    A standalone phrase is trimmed of outer whitespace, internal ASCII
+    whitespace is collapsed, and the phrase is casefolded before exact
+    comparison. Punctuation, quotes, backticks, or extra words make the
+    message non-standalone and return None.
     """
-    stripped = message.strip()
-    lowered = " ".join(stripped.split())
-    if lowered in VOICE_STOP:
+    normalized = " ".join(message.strip().split()).casefold()
+    if normalized in VOICE_STOP:
         return "suspended"
-    if lowered in VOICE_RESUME:
+    if normalized in VOICE_RESUME:
         return "active"
     return None
 
 
 def validate_state(path: Path, expected: str) -> None:
     text = normalize(read_text(path))
-    contract_match = exactly_one(STATE_PATTERN, text, "saitalk_contract")
-    status_match = exactly_one(STATE_STATUS_PATTERN, text, "saitalk_status")
-    voice_match = exactly_one(STATE_VOICE_PATTERN, text, "saitalk_voice")
+    top = _top_level_lines(text)
+    contract_match = exactly_one(STATE_PATTERN, top, "saitalk_contract")
+    status_match = exactly_one(STATE_STATUS_PATTERN, top, "saitalk_status")
+    voice_match = exactly_one(STATE_VOICE_PATTERN, top, "saitalk_voice")
 
     actual = contract_match.group(1)
     if actual != expected:
@@ -365,7 +593,8 @@ def validate_state(path: Path, expected: str) -> None:
         )
 
 
-LANGUAGES = frozenset({"en", "et", "ru"})
+def _normalize_language(value: str) -> str:
+    return value.strip().casefold()
 
 
 def resolve_artifact_language(
@@ -376,47 +605,109 @@ def resolve_artifact_language(
 ) -> str:
     """Resolve the effective artifact prose language.
 
-    Precedence for a fixed configured value (en/et/ru):
+    One global precedence, identical for a fixed and `auto` configuration:
+
     1. explicit language required by the current artifact task;
     2. existing artifact language when editing;
     3. repository-local artifact language contract;
-    4. configured `artifact_language`;
-    5. English fallback.
+    4. configured `artifact_language`, or English when configured is `auto`.
 
-    For `auto`: existing artifact language > explicit task language >
-    repository documentation language > English.
+    Each explicit source (task, existing, repo) is honored as long as it is
+    a well-formed language tag, even when it is not one of the configured
+    `en`/`et`/`ru` languages. A malformed or empty explicit value at any of
+    the three levels fails loudly instead of being silently ignored. An
+    invalid configured value fails loudly instead of being returned.
     """
+    if configured not in ARTIFACT_CONFIG:
+        raise SaitalkError(
+            f"artifact_language: invalid value {configured!r}; "
+            "allowed: en, et, ru, auto"
+        )
+
+    sources = (
+        ("task", task_language),
+        ("existing", existing_language),
+        ("repo", repo_language),
+    )
+    resolved: dict[str, str] = {}
+    for label, value in sources:
+        if value is None:
+            continue
+        candidate = _normalize_language(value)
+        if not candidate:
+            raise SaitalkError(
+                f"artifact_language: explicit {label} language is empty"
+            )
+        if not LANGUAGE_TAG.fullmatch(candidate):
+            raise SaitalkError(
+                f"artifact_language: explicit {label} language {value!r} "
+                "is not a well-formed language tag"
+            )
+        resolved[label] = candidate
+
+    for label in ("task", "existing", "repo"):
+        if label in resolved:
+            return resolved[label]
     if configured == "auto":
-        for candidate in (existing_language, task_language, repo_language):
-            if candidate in LANGUAGES:
-                return candidate
         return "en"
-    for candidate in (task_language, existing_language, repo_language):
-        if candidate in LANGUAGES:
-            return candidate
     return configured
 
 
+def _drift_normalize(text: str) -> str:
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", text.casefold()).split())
+
+
+DRIFT_TOKENS = tuple(_drift_normalize(token) for token in DRIFT_BANNED)
+
+
 def validate_drift(root: Path) -> None:
+    """Reject banned rule tokens anywhere in an adapter file's normalized text.
+
+    Normalization runs over the whole document, not line by line, so a
+    banned phrase split across a markdown line-wrap (`completion-\\nfirst`)
+    cannot evade the guard. The reported line number is best-effort (the
+    first line containing the token's first word).
+    """
     transport_dir = root / "adapters"
     if not transport_dir.is_dir():
         return
-    for path in sorted(transport_dir.glob("*.md")):
+    for path in sorted(transport_dir.rglob("*.md")):
         text = normalize(read_text(path))
-        for line_number, line in enumerate(text.splitlines(), 1):
-            lowered = line.lower()
-            for token in DRIFT_BANNED:
-                if token in lowered:
-                    raise SaitalkError(
-                        f"drift: {path.relative_to(root)}:{line_number} "
-                        f"contains independent-rule token {token!r}; "
-                        f"transport files must not restate or extend the contract"
-                    )
+        lines = text.splitlines()
+        normalized_doc = _drift_normalize(text)
+        for token in DRIFT_TOKENS:
+            if re.search(rf"\b{re.escape(token)}\b", normalized_doc):
+                first_word = token.split()[0]
+                line_number = next(
+                    (i for i, line in enumerate(lines, 1) if first_word in _drift_normalize(line)),
+                    0,
+                )
+                raise SaitalkError(
+                    f"drift: {path.relative_to(root)}:{line_number} contains "
+                    f"rule token {token!r}; this is a structural drift guard, "
+                    "not proof of semantic conformance. Transport files must "
+                    "not restate or extend the contract"
+                )
+
+
+def validate_package(
+    contract_path: Path,
+    conf_path: Path,
+    skill_path: Path,
+    state_path: Path | None = None,
+) -> tuple[str, dict[str, str]]:
+    """Validate manifest, active-root drift, and optional bound state in one path."""
+    contract_id, config = validate(contract_path, conf_path, skill_path)
+    validate_drift(contract_path.resolve().parent)
+    if state_path is not None:
+        validate_state(state_path, contract_id)
+    return contract_id, config
 
 
 def root_paths() -> tuple[Path, Path, Path]:
     root = Path(__file__).resolve().parents[1]
-    return root / "SAITALK.md", root / "saitalk.conf", root / "SKILL.md"
+    contract, conf, skill = RUNTIME_MANIFEST
+    return root / contract, root / conf, root / skill
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -461,16 +752,14 @@ def main() -> int:
             print(f"SAITALK REFRESHED: contract_id={contract_id}")
             return 0
 
-        contract_id, config = validate(contract_path, conf_path, skill_path)
-
         if args.command == "print-id":
+            contract_id, _ = validate(contract_path, conf_path, skill_path)
             print(contract_id)
             return 0
 
-        validate_drift(root_paths()[0].parent)
-
-        if args.state is not None:
-            validate_state(args.state, contract_id)
+        contract_id, config = validate_package(
+            contract_path, conf_path, skill_path, getattr(args, "state", None)
+        )
 
         state = f"; state={args.state}: PASS" if args.state else ""
         print(

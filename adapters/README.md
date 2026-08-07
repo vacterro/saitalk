@@ -24,13 +24,16 @@ Place the complete SAITALK directory in a supported skills location. The root
 
 ## Orchestrator
 
-Load SAITALK before worker dispatch. Persist the validated `contract_id` in
-handoff state. Reject stale workers that claim a different ID.
+Load SAITALK before worker dispatch. Persist the complete bound SAITALK
+state in handoff state — `saitalk_contract`, `saitalk_status`, and
+`saitalk_voice` (SAITALK.md §11), not `contract_id` alone: voice suspension
+survives handoff only when `saitalk_voice` is carried too. Reject stale
+workers that claim a different `saitalk_contract`.
 
 ## Stateless chat
 
-Paste `adapters/GENERIC_SYSTEM_PROMPT.md`, then attach or paste `SAITALK.md`
-and `saitalk.conf`.
+Paste `adapters/GENERIC_SYSTEM_PROMPT.md`, then attach or paste `SKILL.md`,
+`SAITALK.md`, and `saitalk.conf`.
 
 No adapter is normative. If an adapter conflicts with `SAITALK.md`, fix the
 adapter.

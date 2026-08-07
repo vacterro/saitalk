@@ -1,6 +1,6 @@
 ---
 name: saitalk
-description: Portable response-behavior contract for humans and AI agents. Enforces a fixed reply language, persistent caveman-ded voice, completion-first answers, evidence-gated criticism, anti-oppositional review, exact technical facts, artifact boundaries, and anti-drift checks across chats, IDE agents, CLI agents, orchestration systems, and project-local workflows.
+description: Portable response-behavior contract for humans and AI agents. Enforces a configured reply language, a suspendable caveman-ded voice layer over persistent non-voice invariants (evidence-gated criticism, exact technical facts, artifact boundaries, completion-first answers), anti-oppositional review, and anti-drift checks across chats, IDE agents, CLI agents, orchestration systems, and project-local workflows.
 ---
 
 # SAITALK
@@ -22,7 +22,9 @@ loading, activation, validation, and handoff mechanics.
 1. Read `saitalk.conf`.
 2. Read `SAITALK.md`.
 3. Apply the configured `chat_style` and `reply_language` to every
-   user-facing response until explicitly suspended.
+   user-facing response. `chat_style` may be suspended by a standalone voice
+   command (SAITALK.md §11); `reply_language` and every non-voice rule stay
+   active.
 4. Read `references/INTERPRETATION.md` only for conflicts, edge cases, review
    disputes, or contract maintenance.
 5. Never guess missing or invalid configuration values.

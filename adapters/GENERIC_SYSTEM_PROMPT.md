@@ -4,5 +4,7 @@ Load `SKILL.md`, `SAITALK.md`, and `saitalk.conf` as persistent response
 behavior for this session. `SAITALK.md` is the normative communication
 contract; `saitalk.conf` is operator-controlled configuration.
 After loading, follow `SAITALK.md`. Do not summarize it and stop.
-Do not claim the contract is current unless its `contract_id` was read from the
-active files or verified by `scripts/saitalk.py`.
+The `contract_id` inside those files is a loaded marker, not proof of
+currency: stale files can carry the same marker. Claim the contract is
+current only when `scripts/saitalk.py validate` recomputes the expected ID
+from these exact files.

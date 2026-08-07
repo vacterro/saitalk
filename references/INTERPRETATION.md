@@ -62,19 +62,39 @@ before hashing.
 Canonicalization:
 
 1. Decode UTF-8 (non-UTF-8 is a failure).
-2. Normalize CRLF and CR to LF.
-3. Require exactly one `contract_id` line in each manifest member that carries
+2. Strip a leading UTF-8 BOM if present.
+3. Normalize CRLF and CR to LF.
+4. Require exactly one `contract_id` line in each manifest member that carries
    one.
-4. Replace only each value with `<SAITALK-CONTRACT>`.
-5. Build the payload as `path\ncontent\n` pairs in sorted path order.
-6. SHA-256 the bytes.
-7. Use the first sixteen lowercase hexadecimal characters.
-8. Prefix with `saitalk-`.
+5. Replace only each value with `<SAITALK-CONTRACT>`.
+6. Build the payload as `path\ncontent\n` pairs in sorted path order.
+7. SHA-256 the bytes.
+8. Use the first sixteen lowercase hexadecimal characters.
+9. Prefix with `saitalk-`.
 
 Any change to a normative runtime file (contract, config, or SKILL.md)
 invalidates stale checkpoints. The marker proves the three executed runtime
 files are exactly the validated set; it does not prove behavioral
 conformance. Adapters are transport and are deliberately not hashed.
+
+The marker is a deterministic consistency and freshness fingerprint, not
+authentication and not proof that edited rules are correct. It is not a
+security seal. It is a canonical-content fingerprint, not exact-byte
+identity: CRLF vs LF line endings and a leading UTF-8 BOM are intentionally
+canonicalized away before hashing (steps 2-3 above), so two files that
+differ only in those bytes still hash identically; `refresh` separately
+preserves each file's own original line-ending and BOM convention when it
+writes the new marker back (it changes only the `contract_id` bytes).
+Freshness has three distinct levels:
+
+- `loaded ID`: the value read from the active files. Proves only that the
+  marker text is literally present and equal to whatever it is being checked
+  against — marker text can simply be copied from one file to another. Only
+  recomputation establishes canonicalized-manifest consistency.
+- `validated/current ID`: the expected hash recomputed successfully against
+  the active manifest (what `scripts/saitalk.py validate` does).
+- `checkpoint-backed current`: a previously validator-backed ID that still
+  matches the active validated manifest.
 
 ## 5. Completion versus challenge
 
@@ -125,7 +145,8 @@ A person can use SAITALK without an agent framework:
 1. Keep the directory with the project or notes.
 2. Paste `adapters/GENERIC_SYSTEM_PROMPT.md` into a custom instruction field.
 3. Attach `SKILL.md`, `SAITALK.md`, and `saitalk.conf` when starting a session.
-4. Run the validator after changing either file.
+4. Run the validator after changing any runtime-manifest member (`SAITALK.md`,
+   `saitalk.conf`, or `SKILL.md`).
 5. Store the current `contract_id` in long-running task state.
 
 The files remain readable because humans eventually have to debug the machinery
@@ -134,10 +155,14 @@ they invented. Tragic, but unavoidable.
 ## 9. Agent use
 
 An orchestrator should load SAITALK before task context, then preserve the
-contract through handoff.
+complete bound state through handoff — `saitalk_contract`, `saitalk_status`,
+and `saitalk_voice` (§11) — not the contract_id alone; a suspended voice
+survives handoff only when `saitalk_voice` is carried in the serialized
+state.
 
-A worker agent should never claim a current contract without reading the active
-files or receiving a validator-backed checkpoint.
+A worker agent should never claim a current contract without a
+validator-backed ID recomputed from the active files, or a checkpoint backed
+by such an ID.
 
 A reviewer agent should apply the same evidence gate as an executor.
 
@@ -145,7 +170,8 @@ A reviewer agent should apply the same evidence gate as an executor.
 
 SAITALK cannot force compliance in a host that ignores supplied instructions.
 
-Validation proves file integrity and state freshness. It does not prove that a
+Validation proves the marker matches the recomputed hash of the executed
+file set and that bound state is fresh. It does not prove that a
 model actually obeyed every response rule. Behavioral evals cover that second
 problem, and only a recorded model/host run may claim `PASS`; unrun cases stay
 `NOT_RUN` (evals/README.md).
