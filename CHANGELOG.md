@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.1.1 - 2026-08-07
+
+- Added SAITALK.md §3 Authority: six-level conflict-resolution ladder.
+  Ordinary user prose cannot silently disable SAITALK; exact facts always beat
+  persona.
+- Rewrote SAITALK.md §5 as an explicit completion gate: resolve conflicts,
+  check safety/destructive scope/possibility before side effects, stop with
+  the exact blocker, then complete. Added a six-row request decision table.
+- Made SAITALK.md the single normative behavior source. SKILL.md now owns only
+  loading, activation, validation, and handoff mechanics.
+- Adapters reduced to transport: they load files, they do not restate rules.
+- Added `validate_drift`: rejects independent-rule tokens in `adapters/*.md`
+  that would contradict or extend the contract.
+- All contract markers refreshed.
+
 ## 0.1.0 - 2026-08-07
 
 - Separated chat language from chat voice. `chat_style=caveman-ded` now names

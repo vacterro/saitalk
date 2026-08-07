@@ -125,7 +125,7 @@ py -m unittest discover -s tests -v
 
 ## Version
 
-Current release: 0.1.0. See [CHANGELOG.md](CHANGELOG.md).
+Current release: 0.1.1. See [CHANGELOG.md](CHANGELOG.md).
 
 ## Core behavior
 

@@ -15,6 +15,22 @@ CONF_PATTERN = re.compile(r"(?m)^([a-z_]+)=(\S.*)$")
 STATE_PATTERN = re.compile(r"(?m)^saitalk_contract:\s*(\S+)\s*$")
 STATE_STATUS_PATTERN = re.compile(r"(?m)^saitalk_status:\s*(\S+)\s*$")
 
+DRIFT_BANNED = (
+    "authority",
+    "completion-first",
+    "hard bans",
+    "evidence gate",
+    "evidence-gated",
+    "stop caveman",
+    "normal mode",
+    "decision table",
+    "higher priority",
+    "take precedence",
+    "overrides",
+    "required value",
+    "caveman-ded",
+)
+
 LEGACY_STYLE = "caveman-ded-en"
 ALLOWED = {
     "spec_version": {"2"},
@@ -184,6 +200,23 @@ def validate_state(path: Path, expected: str) -> None:
         )
 
 
+def validate_drift(root: Path) -> None:
+    transport_dir = root / "adapters"
+    if not transport_dir.is_dir():
+        return
+    for path in sorted(transport_dir.glob("*.md")):
+        text = normalize(read_text(path))
+        for line_number, line in enumerate(text.splitlines(), 1):
+            lowered = line.lower()
+            for token in DRIFT_BANNED:
+                if token in lowered:
+                    raise SaitalkError(
+                        f"drift: {path.relative_to(root)}:{line_number} "
+                        f"contains independent-rule token {token!r}; "
+                        f"transport files must not restate or extend the contract"
+                    )
+
+
 def root_paths() -> tuple[Path, Path]:
     root = Path(__file__).resolve().parents[1]
     return root / "SAITALK.md", root / "saitalk.conf"
@@ -229,6 +262,8 @@ def main() -> int:
         if args.command == "print-id":
             print(contract_id)
             return 0
+
+        validate_drift(root_paths()[0].parent)
 
         if args.state is not None:
             validate_state(args.state, contract_id)

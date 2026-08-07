@@ -143,6 +143,31 @@ class SaitalkTests(unittest.TestCase):
             with self.assertRaises(saitalk.SaitalkError):
                 saitalk.validate(contract, conf)
 
+    def test_clean_transport_passes_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            adapters = root / "adapters"
+            adapters.mkdir()
+            (adapters / "BOOTSTRAP.md").write_text(
+                "# Bootstrap\n\nLoad SAITALK.md and saitalk.conf.\n",
+                encoding="utf-8",
+            )
+            saitalk.validate_drift(root)
+
+    def test_contradictory_transport_fails_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            adapters = root / "adapters"
+            adapters.mkdir()
+            (adapters / "BOOTSTRAP.md").write_text(
+                "# Bootstrap\n\nHost rules have higher priority than SAITALK.\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(saitalk.SaitalkError) as ctx:
+                saitalk.validate_drift(root)
+            self.assertIn("drift:", str(ctx.exception))
+            self.assertIn("higher priority", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

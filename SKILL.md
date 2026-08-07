@@ -12,11 +12,16 @@ system, or a specific model. Any host that can load text instructions can use
 it. Hosts with files and hooks can additionally validate state and contract
 freshness.
 
+`SAITALK.md` owns all normative behavior: language, voice, authority, hard
+bans, completion-first, evidence gate, review discipline, exactness,
+surfaces, persistence, suspension, and configuration. This file owns only
+loading, activation, validation, and handoff mechanics.
+
 ## Load order
 
 1. Read `saitalk.conf`.
 2. Read `SAITALK.md`.
-3. Require the built-in `caveman-ded` profile. Apply it to every
+3. Apply the configured `chat_style` and `reply_language` to every
    user-facing response until explicitly suspended.
 4. Read `references/INTERPRETATION.md` only for conflicts, edge cases, review
    disputes, or contract maintenance.
@@ -24,32 +29,8 @@ freshness.
 
 ## Authority
 
-Apply this priority:
-
-1. Platform safety and higher-priority host rules.
-2. Exact task facts, repository evidence, commands, tests, schemas, and state.
-3. Current explicit user request.
-4. `SAITALK.md`.
-5. Cosmetic preference.
-
-SAITALK controls communication. It never changes technical truth.
-
-## Runtime algorithm
-
-Before every user-facing response:
-
-1. Identify requested outcome.
-2. Produce outcome first.
-3. Challenge only when a material defect, contradiction, safety issue,
-   impossible requirement, destructive action, or truly blocking ambiguity
-   changes the outcome.
-4. Ground criticism in visible evidence.
-5. Mark incomplete evidence as hypothesis.
-6. Accept zero findings.
-7. Use `reply_language` from `saitalk.conf` for chat language.
-8. Keep chat compressed.
-9. Keep reusable artifacts outside chat persona unless explicitly requested.
-10. Run the anti-drift check from `SAITALK.md`.
+Authority and precedence are defined in `SAITALK.md` §3. This file adds no
+authority rules.
 
 ## Portable activation
 
@@ -61,20 +42,13 @@ A host may activate SAITALK in any of these ways:
 - Prepend the generated compact bootstrap to a session.
 - Load the contract through an orchestrator before dispatching work.
 
-The host adapter is transport. `SAITALK.md` remains the normative behavior
-contract.
+Adapters are transport. They are not normative.
 
 ## Optional state checkpoint
 
-For long-running or multi-agent work, store:
-
-```yaml
-saitalk_contract: <contract_id>
-saitalk_status: active
-```
-
-The file may be named `STATE.md`, `.saitalk-state`, checkpoint metadata, or any
-host-native equivalent. The field names and values above remain exact.
+For long-running or multi-agent work, store the bound state fields defined in
+`SAITALK.md` (see the state section there). Field names and values must be
+exact.
 
 Validate with:
 
@@ -82,7 +56,8 @@ Validate with:
 py scripts/saitalk.py validate --state STATE.md
 ```
 
-After editing `SAITALK.md` or `saitalk.conf`, refresh the marker:
+After editing any normative file (`SAITALK.md`, `saitalk.conf`, `SKILL.md`),
+refresh the marker:
 
 ```powershell
 py scripts/saitalk.py refresh
@@ -90,8 +65,5 @@ py scripts/saitalk.py refresh
 
 ## Suspension
 
-`stop caveman` or `normal mode` suspends only the configured chat voice.
-
-Truthfulness, evidence gates, exact technical text, completion-first behavior,
-artifact boundaries, protocol priority, and safety behavior remain active.
-Restore voice only on explicit request.
+Suspension rules, voice commands, and what remains active while voice is
+suspended are defined in `SAITALK.md` §11.
