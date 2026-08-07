@@ -430,15 +430,18 @@ def build_parser() -> argparse.ArgumentParser:
     refresh_parser = sub.add_parser("refresh", help="Refresh contract_id.")
     refresh_parser.add_argument("--contract", type=Path)
     refresh_parser.add_argument("--config", type=Path)
+    refresh_parser.add_argument("--skill", type=Path)
 
     validate_parser = sub.add_parser("validate", help="Validate contract and config.")
     validate_parser.add_argument("--contract", type=Path)
     validate_parser.add_argument("--config", type=Path)
     validate_parser.add_argument("--state", type=Path)
+    validate_parser.add_argument("--skill", type=Path)
 
     print_parser = sub.add_parser("print-id", help="Print current valid contract_id.")
     print_parser.add_argument("--contract", type=Path)
     print_parser.add_argument("--config", type=Path)
+    print_parser.add_argument("--skill", type=Path)
 
     return parser
 
@@ -448,7 +451,7 @@ def resolve_paths(args: argparse.Namespace) -> tuple[Path, Path, Path]:
     return (
         args.contract or default_contract,
         args.config or default_conf,
-        default_skill,
+        args.skill or default_skill,
     )
 
 

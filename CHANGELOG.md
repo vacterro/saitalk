@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.1.6 - 2026-08-07
+
+- Expanded the regression suite from 5 tests to 34, organized as config,
+  state, seal, refresh, CLI-subprocess, and canonical-suite classes.
+- Library coverage: every allowed and every invalid language; valid and
+  invalid style; `response_budget` boundaries 0/1/20/21/-1 and non-integer;
+  missing, extra, duplicate, and empty config keys; duplicate and stale
+  `contract_id`; CRLF normalization; invalid UTF-8; missing file; directory
+  path; duplicate/missing state fields; invalid status; invalid voice;
+  suspension/resume transitions; unrelated host state fields; SKILL mutation
+  invalidation; atomic refresh rollback.
+- CLI subprocess coverage: `validate`, `refresh`, `print-id`;
+  `--contract`, `--config`, `--state`, `--skill` overrides; exact exit codes;
+  correct stdout/stderr; no raw traceback on expected failures; lock
+  contention.
+- Stable package import: `from scripts import saitalk` via `scripts/__init__.py`
+  instead of a bare cached module name.
+- Canonical suite validates the shipped `examples/STATE.md` and the live
+  package.
+
 ## 0.1.5 - 2026-08-07
 
 - `refresh` is now transactional: cross-platform process lock, sibling temp
