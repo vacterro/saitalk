@@ -106,8 +106,11 @@ Store:
 ```yaml
 saitalk_contract: <current contract_id>
 saitalk_status: active
+saitalk_voice: active
 ```
 
+Each field appears exactly once. `saitalk_status` is always `active`;
+`saitalk_voice` is `active` or `suspended` (suspends chat styling only).
 Validate state:
 
 ```powershell
@@ -125,7 +128,7 @@ py -m unittest discover -s tests -v
 
 ## Version
 
-Current release: 0.1.2. See [CHANGELOG.md](CHANGELOG.md).
+Current release: 0.1.3. See [CHANGELOG.md](CHANGELOG.md).
 
 ## Core behavior
 

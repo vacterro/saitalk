@@ -17,6 +17,10 @@ CONTRACT_PATTERN = re.compile(r"(?m)^contract_id\s*[:=]\s*(\S+)\s*$")
 CONF_PATTERN = re.compile(r"(?m)^([a-z_]+)=(\S.*)$")
 STATE_PATTERN = re.compile(r"(?m)^saitalk_contract:\s*(\S+)\s*$")
 STATE_STATUS_PATTERN = re.compile(r"(?m)^saitalk_status:\s*(\S+)\s*$")
+STATE_VOICE_PATTERN = re.compile(r"(?m)^saitalk_voice:\s*(\S+)\s*$")
+
+VOICE_STOP = {"stop caveman", "normal mode"}
+VOICE_RESUME = {"resume caveman", "saitalk mode"}
 
 DRIFT_BANNED = (
     "authority",
@@ -204,17 +208,41 @@ def validate(contract_path: Path, conf_path: Path, skill_path: Path) -> tuple[st
     return expected, config
 
 
+def voice_command(message: str) -> str | None:
+    """Return the target voice state for a standalone voice control command.
+
+    Returns None when the message is not a standalone control phrase. A phrase
+    embedded in quotation, code, a pasted document, an example, or discussion
+    about the command does not change state.
+    """
+    stripped = message.strip()
+    lowered = " ".join(stripped.split())
+    if lowered in VOICE_STOP:
+        return "suspended"
+    if lowered in VOICE_RESUME:
+        return "active"
+    return None
+
+
 def validate_state(path: Path, expected: str) -> None:
     text = normalize(read_text(path))
-    actual = exactly_one(STATE_PATTERN, text, "saitalk_contract").group(1)
+    contract_match = exactly_one(STATE_PATTERN, text, "saitalk_contract")
+    status_match = exactly_one(STATE_STATUS_PATTERN, text, "saitalk_status")
+    voice_match = exactly_one(STATE_VOICE_PATTERN, text, "saitalk_voice")
+
+    actual = contract_match.group(1)
     if actual != expected:
         raise SaitalkError(
             f"saitalk_contract: found {actual!r}, expected {expected!r}"
         )
-    status_match = STATE_STATUS_PATTERN.search(text)
-    if status_match is not None and status_match.group(1) != "active":
+    if status_match.group(1) != "active":
         raise SaitalkError(
             f"saitalk_status: found {status_match.group(1)!r}, expected 'active'"
+        )
+    if voice_match.group(1) not in ("active", "suspended"):
+        raise SaitalkError(
+            f"saitalk_voice: found {voice_match.group(1)!r}, "
+            "expected 'active' or 'suspended'"
         )
 
 

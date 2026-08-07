@@ -47,8 +47,16 @@ Adapters are transport. They are not normative.
 ## Optional state checkpoint
 
 For long-running or multi-agent work, store the bound state fields defined in
-`SAITALK.md` (see the state section there). Field names and values must be
-exact.
+`SAITALK.md` §11:
+
+```yaml
+saitalk_contract: <contract_id>
+saitalk_status: active
+saitalk_voice: active
+```
+
+Field names and values must be exact; each field appears exactly once.
+Unrelated host-native state fields may coexist.
 
 Validate with:
 

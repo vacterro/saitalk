@@ -49,7 +49,9 @@ class SaitalkTests(unittest.TestCase):
 
             state = root / "STATE.md"
             state.write_text(
-                f"saitalk_contract: {expected}\nsaitalk_status: active\n",
+                f"saitalk_contract: {expected}\n"
+                "saitalk_status: active\n"
+                "saitalk_voice: active\n",
                 encoding="utf-8",
             )
             saitalk.validate_state(state, expected)
@@ -82,7 +84,8 @@ class SaitalkTests(unittest.TestCase):
             state = root / "STATE.md"
             state.write_text(
                 "saitalk_contract: saitalk-12345678\n"
-                "saitalk_status: inactive\n",
+                "saitalk_status: inactive\n"
+                "saitalk_voice: active\n",
                 encoding="utf-8",
             )
             with self.assertRaises(saitalk.SaitalkError):
@@ -94,10 +97,77 @@ class SaitalkTests(unittest.TestCase):
             state = root / "STATE.md"
             state.write_text(
                 "saitalk_contract: saitalk-12345678\n"
-                "saitalk_status: active\n",
+                "saitalk_status: active\n"
+                "saitalk_voice: active\n",
                 encoding="utf-8",
             )
             saitalk.validate_state(state, "saitalk-12345678")
+
+    def _state(self, root: Path, contract: str, status: str, voice: str) -> Path:
+        state = root / "STATE.md"
+        state.write_text(
+            f"saitalk_contract: {contract}\n"
+            f"saitalk_status: {status}\n"
+            f"saitalk_voice: {voice}\n",
+            encoding="utf-8",
+        )
+        return state
+
+    def test_duplicate_status_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            state = root / "STATE.md"
+            state.write_text(
+                "saitalk_contract: saitalk-12345678\n"
+                "saitalk_status: active\n"
+                "saitalk_status: active\n"
+                "saitalk_voice: active\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(saitalk.SaitalkError) as ctx:
+                saitalk.validate_state(state, "saitalk-12345678")
+            self.assertIn("exactly one match", str(ctx.exception))
+
+    def test_missing_voice_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            state = root / "STATE.md"
+            state.write_text(
+                "saitalk_contract: saitalk-12345678\n"
+                "saitalk_status: active\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(saitalk.SaitalkError) as ctx:
+                saitalk.validate_state(state, "saitalk-12345678")
+            self.assertIn("exactly one match", str(ctx.exception))
+
+    def test_invalid_voice_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            state = self._state(root, "saitalk-12345678", "active", "partial")
+            with self.assertRaises(saitalk.SaitalkError) as ctx:
+                saitalk.validate_state(state, "saitalk-12345678")
+            self.assertIn("expected 'active' or 'suspended'", str(ctx.exception))
+
+    def test_suspended_voice_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            state = self._state(root, "saitalk-12345678", "active", "suspended")
+            saitalk.validate_state(state, "saitalk-12345678")
+
+    def test_voice_command_standalone(self) -> None:
+        self.assertEqual(saitalk.voice_command("stop caveman"), "suspended")
+        self.assertEqual(saitalk.voice_command("normal mode"), "suspended")
+        self.assertEqual(saitalk.voice_command("resume caveman"), "active")
+        self.assertEqual(saitalk.voice_command("saitalk mode"), "active")
+
+    def test_voice_command_embedded_does_not_fire(self) -> None:
+        self.assertIsNone(saitalk.voice_command("say \"stop caveman\" now"))
+        self.assertIsNone(saitalk.voice_command("```normal mode```"))
+        self.assertIsNone(saitalk.voice_command("she typed stop caveman"))
+        self.assertIsNone(saitalk.voice_command("does the phrase normal mode do anything?"))
+        self.assertIsNone(saitalk.voice_command("stop caveman please"))
+        self.assertIsNone(saitalk.voice_command("resume caveman now"))
 
     def _lang_conf(self, language: str) -> str:
         return (

@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.1.3 - 2026-08-07
+
+- Real state machine: bound state now requires exactly one occurrence of each
+  of `saitalk_contract`, `saitalk_status`, and `saitalk_voice`. Duplicates,
+  missing fields, unknown values, and stale contracts fail validation.
+  Unrelated host-native state fields remain allowed.
+- `saitalk_status` accepts only `active`; `saitalk_voice` accepts `active` or
+  `suspended`.
+- Voice commands are standalone-only: `stop caveman` / `normal mode` suspend;
+  `resume caveman` / `saitalk mode` restore. Quoted, code, pasted, example,
+  or discussion text never changes state.
+- Persistence across compaction and handoff is guaranteed only through the
+  serialized `saitalk_voice` field.
+- All contract markers refreshed.
+
 ## 0.1.2 - 2026-08-07
 
 - Runtime seal: `contract_id` is now a deterministic path-tagged hash of a
