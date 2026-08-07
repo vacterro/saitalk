@@ -49,26 +49,32 @@ A platform adapter may help load the files, but it never owns the rules.
 
 ## 4. Contract marker
 
-The `contract_id` is derived from:
+The `contract_id` is a hash of a runtime manifest. The manifest is:
 
-- the complete normalized `SAITALK.md`;
-- the complete normalized `saitalk.conf`;
+- `SAITALK.md`;
+- `saitalk.conf`;
+- `SKILL.md`;
 
-except that both `contract_id` values are replaced with a fixed sentinel before
-hashing.
+sorted deterministically. For members that carry a `contract_id` field
+(`SAITALK.md`, `saitalk.conf`), that value is replaced with a fixed sentinel
+before hashing.
 
 Canonicalization:
 
-1. Decode UTF-8.
+1. Decode UTF-8 (non-UTF-8 is a failure).
 2. Normalize CRLF and CR to LF.
-3. Require exactly one `contract_id` line in each file.
+3. Require exactly one `contract_id` line in each manifest member that carries
+   one.
 4. Replace only each value with `<SAITALK-CONTRACT>`.
-5. Concatenate `SAITALK.md`, a newline separator, and `saitalk.conf`.
+5. Build the payload as `path\ncontent\n` pairs in sorted path order.
 6. SHA-256 the bytes.
-7. Use the first eight lowercase hexadecimal characters.
+7. Use the first sixteen lowercase hexadecimal characters.
 8. Prefix with `saitalk-`.
 
-Any contract or setting edit invalidates stale checkpoints.
+Any change to a normative runtime file (contract, config, or SKILL.md)
+invalidates stale checkpoints. The marker proves the three executed runtime
+files are exactly the validated set; it does not prove behavioral
+conformance. Adapters are transport and are deliberately not hashed.
 
 ## 5. Completion versus challenge
 

@@ -10,6 +10,9 @@ import sys
 from pathlib import Path
 
 SENTINEL = "<SAITALK-CONTRACT>"
+DIGEST_HEX = 16
+RUNTIME_MANIFEST = ("SAITALK.md", "saitalk.conf", "SKILL.md")
+CONTRACT_ID_FILES = frozenset({"SAITALK.md", "saitalk.conf"})
 CONTRACT_PATTERN = re.compile(r"(?m)^contract_id\s*[:=]\s*(\S+)\s*$")
 CONF_PATTERN = re.compile(r"(?m)^([a-z_]+)=(\S.*)$")
 STATE_PATTERN = re.compile(r"(?m)^saitalk_contract:\s*(\S+)\s*$")
@@ -56,11 +59,14 @@ class SaitalkError(RuntimeError):
 
 def read_text(path: Path) -> str:
     try:
-        return path.read_text(encoding="utf-8")
+        text = path.read_text(encoding="utf-8")
     except FileNotFoundError as exc:
         raise SaitalkError(f"missing file: {path}") from exc
     except UnicodeDecodeError as exc:
         raise SaitalkError(f"not UTF-8: {path}") from exc
+    if text.startswith("\ufeff"):
+        text = text[1:]
+    return text
 
 
 def normalize(text: str) -> str:
@@ -118,6 +124,17 @@ def parse_conf(text: str) -> dict[str, str]:
     return values
 
 
+def read_manifest(contract_path: Path, conf_path: Path, skill_path: Path) -> dict[str, str]:
+    manifest: dict[str, str] = {}
+    for label, path in (("SAITALK.md", contract_path), ("saitalk.conf", conf_path), ("SKILL.md", skill_path)):
+        if path.name != label:
+            raise SaitalkError(
+                f"manifest member mismatch: expected {label!r}, got {path.name!r}"
+            )
+        manifest[label] = read_text(path)
+    return manifest
+
+
 def replace_contract_value(text: str, label: str) -> str:
     normalized = normalize(text)
     match = exactly_one(CONTRACT_PATTERN, normalized, label)
@@ -125,12 +142,15 @@ def replace_contract_value(text: str, label: str) -> str:
     return normalized[:start] + SENTINEL + normalized[end:]
 
 
-def expected_id(contract_text: str, conf_text: str) -> str:
-    canonical_contract = replace_contract_value(contract_text, "SAITALK.md contract_id")
-    canonical_conf = replace_contract_value(conf_text, "saitalk.conf contract_id")
-    payload = canonical_contract + "\n---SAITALK-CONF---\n" + canonical_conf
+def expected_id(manifest: dict[str, str]) -> str:
+    payload = ""
+    for member in sorted(manifest):
+        content = manifest[member]
+        if member in CONTRACT_ID_FILES:
+            content = replace_contract_value(content, f"{member} contract_id")
+        payload += member + "\n" + content + "\n"
     digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
-    return f"saitalk-{digest[:8]}"
+    return f"saitalk-{digest[:DIGEST_HEX]}"
 
 
 def current_contract_id(text: str, label: str) -> str:
@@ -144,33 +164,31 @@ def replace_current_id(text: str, new_id: str, label: str) -> str:
     return normalized[:start] + new_id + normalized[end:]
 
 
-def refresh(contract_path: Path, conf_path: Path) -> str:
-    contract_text = read_text(contract_path)
-    conf_text = read_text(conf_path)
-    parse_conf(conf_text)
+def refresh(contract_path: Path, conf_path: Path, skill_path: Path) -> str:
+    manifest = read_manifest(contract_path, conf_path, skill_path)
+    parse_conf(manifest["saitalk.conf"])
 
-    new_id = expected_id(contract_text, conf_text)
+    new_id = expected_id(manifest)
 
     contract_path.write_text(
-        replace_current_id(contract_text, new_id, "SAITALK.md contract_id"),
+        replace_current_id(manifest["SAITALK.md"], new_id, "SAITALK.md contract_id"),
         encoding="utf-8",
         newline="\n",
     )
     conf_path.write_text(
-        replace_current_id(conf_text, new_id, "saitalk.conf contract_id"),
+        replace_current_id(manifest["saitalk.conf"], new_id, "saitalk.conf contract_id"),
         encoding="utf-8",
         newline="\n",
     )
     return new_id
 
 
-def validate(contract_path: Path, conf_path: Path) -> tuple[str, dict[str, str]]:
-    contract_text = read_text(contract_path)
-    conf_text = read_text(conf_path)
-    config = parse_conf(conf_text)
+def validate(contract_path: Path, conf_path: Path, skill_path: Path) -> tuple[str, dict[str, str]]:
+    manifest = read_manifest(contract_path, conf_path, skill_path)
+    config = parse_conf(manifest["saitalk.conf"])
 
-    expected = expected_id(contract_text, conf_text)
-    contract_current = current_contract_id(contract_text, "SAITALK.md contract_id")
+    expected = expected_id(manifest)
+    contract_current = current_contract_id(manifest["SAITALK.md"], "SAITALK.md contract_id")
     conf_current = config["contract_id"]
 
     if contract_current != expected:
@@ -217,9 +235,9 @@ def validate_drift(root: Path) -> None:
                     )
 
 
-def root_paths() -> tuple[Path, Path]:
+def root_paths() -> tuple[Path, Path, Path]:
     root = Path(__file__).resolve().parents[1]
-    return root / "SAITALK.md", root / "saitalk.conf"
+    return root / "SAITALK.md", root / "saitalk.conf", root / "SKILL.md"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -242,22 +260,26 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def resolve_paths(args: argparse.Namespace) -> tuple[Path, Path]:
-    default_contract, default_conf = root_paths()
-    return args.contract or default_contract, args.config or default_conf
+def resolve_paths(args: argparse.Namespace) -> tuple[Path, Path, Path]:
+    default_contract, default_conf, default_skill = root_paths()
+    return (
+        args.contract or default_contract,
+        args.config or default_conf,
+        default_skill,
+    )
 
 
 def main() -> int:
     args = build_parser().parse_args()
-    contract_path, conf_path = resolve_paths(args)
+    contract_path, conf_path, skill_path = resolve_paths(args)
 
     try:
         if args.command == "refresh":
-            contract_id = refresh(contract_path, conf_path)
+            contract_id = refresh(contract_path, conf_path, skill_path)
             print(f"SAITALK REFRESHED: contract_id={contract_id}")
             return 0
 
-        contract_id, config = validate(contract_path, conf_path)
+        contract_id, config = validate(contract_path, conf_path, skill_path)
 
         if args.command == "print-id":
             print(contract_id)

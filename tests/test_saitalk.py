@@ -11,9 +11,10 @@ import saitalk  # noqa: E402
 
 
 class SaitalkTests(unittest.TestCase):
-    def create_files(self, root: Path) -> tuple[Path, Path]:
+    def create_files(self, root: Path) -> tuple[Path, Path, Path]:
         contract = root / "SAITALK.md"
         conf = root / "saitalk.conf"
+        skill = root / "SKILL.md"
 
         contract.write_text(
             "# Contract\n\ncontract_id: saitalk-00000000\n\nBody.\n",
@@ -29,15 +30,19 @@ class SaitalkTests(unittest.TestCase):
             "contract_id=saitalk-00000000\n",
             encoding="utf-8",
         )
-        return contract, conf
+        skill.write_text(
+            "# SKILL\n\nLoad order mechanics only.\n",
+            encoding="utf-8",
+        )
+        return contract, conf, skill
 
     def test_refresh_validate_and_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            contract, conf = self.create_files(root)
+            contract, conf, skill = self.create_files(root)
 
-            expected = saitalk.refresh(contract, conf)
-            actual, config = saitalk.validate(contract, conf)
+            expected = saitalk.refresh(contract, conf, skill)
+            actual, config = saitalk.validate(contract, conf, skill)
 
             self.assertEqual(actual, expected)
             self.assertEqual(config["reply_language"], "en")
@@ -52,13 +57,13 @@ class SaitalkTests(unittest.TestCase):
     def test_invalid_language_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            contract, conf = self.create_files(root)
+            contract, conf, skill = self.create_files(root)
             text = conf.read_text(encoding="utf-8").replace(
                 "reply_language=en", "reply_language=eesti"
             )
             conf.write_text(text, encoding="utf-8")
             with self.assertRaises(saitalk.SaitalkError):
-                saitalk.validate(contract, conf)
+                saitalk.validate(contract, conf, skill)
 
     def test_stale_state_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -110,23 +115,23 @@ class SaitalkTests(unittest.TestCase):
             with self.subTest(language=language):
                 with tempfile.TemporaryDirectory() as temp:
                     root = Path(temp)
-                    contract, conf = self.create_files(root)
+                    contract, conf, skill = self.create_files(root)
                     conf.write_text(self._lang_conf(language), encoding="utf-8")
-                    saitalk.refresh(contract, conf)
-                    _, config = saitalk.validate(contract, conf)
+                    saitalk.refresh(contract, conf, skill)
+                    _, config = saitalk.validate(contract, conf, skill)
                     self.assertEqual(config["reply_language"], language)
                     self.assertEqual(config["chat_style"], "caveman-ded")
 
     def test_legacy_caveman_ded_en_fails_with_exact_repair(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            contract, conf = self.create_files(root)
+            contract, conf, skill = self.create_files(root)
             conf.write_text(
                 self._lang_conf("ru").replace("caveman-ded\n", "caveman-ded-en\n"),
                 encoding="utf-8",
             )
             with self.assertRaises(saitalk.SaitalkError) as ctx:
-                saitalk.validate(contract, conf)
+                saitalk.validate(contract, conf, skill)
             message = str(ctx.exception)
             self.assertIn("legacy value 'caveman-ded-en'", message)
             self.assertIn("chat_style=caveman-ded", message)
@@ -135,13 +140,13 @@ class SaitalkTests(unittest.TestCase):
     def test_unknown_style_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            contract, conf = self.create_files(root)
+            contract, conf, skill = self.create_files(root)
             conf.write_text(
                 self._lang_conf("en").replace("caveman-ded\n", "polite-robot\n"),
                 encoding="utf-8",
             )
             with self.assertRaises(saitalk.SaitalkError):
-                saitalk.validate(contract, conf)
+                saitalk.validate(contract, conf, skill)
 
     def test_clean_transport_passes_drift(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -167,6 +172,44 @@ class SaitalkTests(unittest.TestCase):
                 saitalk.validate_drift(root)
             self.assertIn("drift:", str(ctx.exception))
             self.assertIn("higher priority", str(ctx.exception))
+
+    def test_digest_has_sixteen_hex(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            contract, conf, skill = self.create_files(root)
+            expected = saitalk.refresh(contract, conf, skill)
+            self.assertTrue(expected.startswith("saitalk-"))
+            self.assertEqual(len(expected), len("saitalk-") + 16)
+
+    def test_skill_mutation_invalidates_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            contract, conf, skill = self.create_files(root)
+            expected = saitalk.refresh(contract, conf, skill)
+            skill.write_text(
+                "# SKILL\n\nLoad order mechanics only, with a mutated normative line.\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(saitalk.SaitalkError) as ctx:
+                saitalk.validate(contract, conf, skill)
+            self.assertIn("stale contract_id", str(ctx.exception))
+
+    def test_missing_manifest_member_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            contract, conf, skill = self.create_files(root)
+            skill.unlink()
+            with self.assertRaises(saitalk.SaitalkError) as ctx:
+                saitalk.validate(contract, conf, skill)
+            self.assertIn("missing file", str(ctx.exception))
+
+    def test_manifest_member_path_mismatch_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            contract, conf, skill = self.create_files(root)
+            with self.assertRaises(saitalk.SaitalkError) as ctx:
+                saitalk.validate(contract, conf, root / "OTHER.md")
+            self.assertIn("manifest member mismatch", str(ctx.exception))
 
 
 if __name__ == "__main__":

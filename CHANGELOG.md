@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.2 - 2026-08-07
+
+- Runtime seal: `contract_id` is now a deterministic path-tagged hash of a
+  three-member runtime manifest (SAITALK.md, saitalk.conf, SKILL.md), sorted,
+  LF-normalized, UTF-8 with BOM tolerated, sentinel-replaced. Any normative
+  file change now invalidates the marker, including SKILL.md edits.
+- Digest suffix extended from 8 to 16 hexadecimal characters. Marker format
+  migration: `saitalk-<16 hex>`.
+- Missing manifest member or mismatched member path is a clean `SaitalkError`.
+- Adapters are explicitly nonnormative and are not hashed.
+
 ## 0.1.1 - 2026-08-07
 
 - Added SAITALK.md §3 Authority: six-level conflict-resolution ladder.
