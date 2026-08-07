@@ -20,9 +20,9 @@ class SaitalkTests(unittest.TestCase):
             encoding="utf-8",
         )
         conf.write_text(
-            "spec_version=1\n"
+            "spec_version=2\n"
             "reply_language=en\n"
-            "chat_style=caveman-ded-en\n"
+            "chat_style=caveman-ded\n"
             "artifact_language=en\n"
             "review_mode=evidence-gated\n"
             "response_budget=5\n"
@@ -93,6 +93,55 @@ class SaitalkTests(unittest.TestCase):
                 encoding="utf-8",
             )
             saitalk.validate_state(state, "saitalk-12345678")
+
+    def _lang_conf(self, language: str) -> str:
+        return (
+            "spec_version=2\n"
+            f"reply_language={language}\n"
+            "chat_style=caveman-ded\n"
+            "artifact_language=en\n"
+            "review_mode=evidence-gated\n"
+            "response_budget=5\n"
+            "contract_id=saitalk-00000000\n"
+        )
+
+    def test_every_allowed_language_with_caveman_ded_passes(self) -> None:
+        for language in ("en", "et", "ru", "auto"):
+            with self.subTest(language=language):
+                with tempfile.TemporaryDirectory() as temp:
+                    root = Path(temp)
+                    contract, conf = self.create_files(root)
+                    conf.write_text(self._lang_conf(language), encoding="utf-8")
+                    saitalk.refresh(contract, conf)
+                    _, config = saitalk.validate(contract, conf)
+                    self.assertEqual(config["reply_language"], language)
+                    self.assertEqual(config["chat_style"], "caveman-ded")
+
+    def test_legacy_caveman_ded_en_fails_with_exact_repair(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            contract, conf = self.create_files(root)
+            conf.write_text(
+                self._lang_conf("ru").replace("caveman-ded\n", "caveman-ded-en\n"),
+                encoding="utf-8",
+            )
+            with self.assertRaises(saitalk.SaitalkError) as ctx:
+                saitalk.validate(contract, conf)
+            message = str(ctx.exception)
+            self.assertIn("legacy value 'caveman-ded-en'", message)
+            self.assertIn("chat_style=caveman-ded", message)
+            self.assertIn("reply_language=en|et|ru|auto", message)
+
+    def test_unknown_style_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            contract, conf = self.create_files(root)
+            conf.write_text(
+                self._lang_conf("en").replace("caveman-ded\n", "polite-robot\n"),
+                encoding="utf-8",
+            )
+            with self.assertRaises(saitalk.SaitalkError):
+                saitalk.validate(contract, conf)
 
 
 if __name__ == "__main__":

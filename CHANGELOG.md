@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.0 - 2026-08-07
+
+- Separated chat language from chat voice. `chat_style=caveman-ded` now names
+  the voice only (compression, attitude, evidence gate, restrained profanity,
+  no filler, no decorative mixing, no persona leakage). `reply_language` alone
+  selects the chat language.
+- Legacy `chat_style=caveman-ded-en` is rejected with one exact repair
+  instruction (`chat_style=caveman-ded` + a `reply_language` choice) instead
+  of validating while demanding contradictory output.
+- `spec_version` bumped from `1` to `2`.
+- All contract markers refreshed for the migrated contract.
+
 ## 0.0.4 - 2026-08-07
 
 - Removed dead config keys (spec_version, artifact_language, review_mode, response_budget had no runtime effect and no documentation).

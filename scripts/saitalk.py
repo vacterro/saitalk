@@ -15,10 +15,11 @@ CONF_PATTERN = re.compile(r"(?m)^([a-z_]+)=(\S.*)$")
 STATE_PATTERN = re.compile(r"(?m)^saitalk_contract:\s*(\S+)\s*$")
 STATE_STATUS_PATTERN = re.compile(r"(?m)^saitalk_status:\s*(\S+)\s*$")
 
+LEGACY_STYLE = "caveman-ded-en"
 ALLOWED = {
-    "spec_version": {"1"},
+    "spec_version": {"2"},
     "reply_language": {"et", "en", "ru", "auto"},
-    "chat_style": {"caveman-ded-en"},
+    "chat_style": {"caveman-ded"},
     "artifact_language": {"en", "et", "ru", "auto"},
     "review_mode": {"evidence-gated"},
 }
@@ -82,6 +83,11 @@ def parse_conf(text: str) -> dict[str, str]:
     for key, allowed in ALLOWED.items():
         if values[key] not in allowed:
             options = ", ".join(sorted(allowed))
+            if key == "chat_style" and values[key] == LEGACY_STYLE:
+                raise SaitalkError(
+                    "chat_style: legacy value 'caveman-ded-en' merged language into "
+                    "voice; set chat_style=caveman-ded and reply_language=en|et|ru|auto"
+                )
             raise SaitalkError(
                 f"{key}: invalid value {values[key]!r}; allowed: {options}"
             )

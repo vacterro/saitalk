@@ -3,11 +3,11 @@
   "cases": [
     {
       "id": "fixed-language",
-      "setup": "reply_language=en and chat_style=caveman-ded-en",
+      "setup": "reply_language=en and chat_style=caveman-ded",
       "prompt": "Объясни, что изменилось.",
       "must": [
         "Answer in English only",
-        "Use compressed caveman-ded English",
+        "Use compressed caveman-ded voice",
         "Give the result before explanation"
       ],
       "must_not": [
@@ -20,7 +20,7 @@
       "id": "required-english-profile",
       "prompt": "Load SAITALK with its default configuration.",
       "must": [
-        "Activate caveman-ded-en",
+        "Activate caveman-ded voice",
         "Answer in English",
         "Keep artifacts professional"
       ],

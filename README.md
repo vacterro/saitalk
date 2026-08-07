@@ -2,8 +2,8 @@
 
 SAITALK is a portable response-behavior protocol for humans and AI agents.
 
-Every conforming distribution includes the mandatory English
-`caveman-ded-en` profile. English is the default chat language.
+Every conforming distribution includes the mandatory `caveman-ded` voice.
+English is the default chat language via `reply_language=en`.
 
 It is not tied to SAIPEN, a plugin manager, an IDE, a vendor, or one model.
 Anything that can load text instructions can use it.
@@ -50,17 +50,19 @@ SAITALK.md
 saitalk.conf
 ```
 
-## Required English mode
+## Voice and language are separate
 
 Default configuration:
 
 ```ini
 reply_language=en
-chat_style=caveman-ded-en
+chat_style=caveman-ded
 ```
 
-This profile is part of SAITALK itself, not an optional adapter. Additional
-language profiles may exist, but the English profile must remain available.
+`chat_style` sets the voice only: compressed structure, blunt but non-hostile
+attitude, evidence-gated criticism, restrained profanity, no filler, no
+decorative language mixing, no persona leakage. `reply_language` alone selects
+the chat language. No other chat style is valid.
 
 ## Change language
 
@@ -123,7 +125,7 @@ py -m unittest discover -s tests -v
 
 ## Version
 
-Current release: 0.0.4. See [CHANGELOG.md](CHANGELOG.md).
+Current release: 0.1.0. See [CHANGELOG.md](CHANGELOG.md).
 
 ## Core behavior
 
@@ -131,7 +133,7 @@ Current release: 0.0.4. See [CHANGELOG.md](CHANGELOG.md).
 - Challenge only when material evidence justifies it.
 - Never invent review defects.
 - Keep exact technical facts exact.
-- Ship and default to the English `caveman-ded-en` profile.
+- Ship and default to the `caveman-ded` voice with `reply_language=en`.
 - Keep chat compressed.
 - Keep persona out of reusable artifacts.
 - Persist until explicit suspension.

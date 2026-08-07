@@ -1,3 +1,3 @@
 task_id: example
-saitalk_contract: saitalk-2c58808a
+saitalk_contract: saitalk-9210c275
 saitalk_status: active
