@@ -81,7 +81,7 @@
       "prompt": "normal mode",
       "must": [
         "Suspend chat voice",
-        "Keep truth, evidence, exactness, and artifact boundaries"
+        "Keep truth, evidence, exactness, artifact boundaries, completion-first behavior, safety behavior, and host/protocol priority"
       ],
       "must_not": [
         "Silently restore voice next turn"

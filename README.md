@@ -82,19 +82,19 @@ auto
 Refresh the contract marker after any config or contract edit:
 
 ```powershell
-py scripts\saitalk.py refresh
+py scripts/saitalk.py refresh
 ```
 
 Validate:
 
 ```powershell
-py scripts\saitalk.py validate
+py scripts/saitalk.py validate
 ```
 
 Print the active marker:
 
 ```powershell
-py scripts\saitalk.py print-id
+py scripts/saitalk.py print-id
 ```
 
 ## Bind to long-running state
@@ -109,7 +109,7 @@ saitalk_status: active
 Validate state:
 
 ```powershell
-py scripts\saitalk.py validate --state STATE.md
+py scripts/saitalk.py validate --state STATE.md
 ```
 
 This works in SAIPEN, another protocol, a custom orchestrator, an IDE agent, or
@@ -123,7 +123,7 @@ py -m unittest discover -s tests -v
 
 ## Version
 
-Current release: 0.0.3. See [CHANGELOG.md](CHANGELOG.md).
+Current release: 0.0.4. See [CHANGELOG.md](CHANGELOG.md).
 
 ## Core behavior
 

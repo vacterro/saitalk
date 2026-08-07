@@ -30,8 +30,8 @@ It is not merely `reply_language=en`. It combines:
 - No fake Russian accent or decorative foreign slang.
 - Professional artifacts outside the chat persona.
 
-A distribution may add other profiles. It may not claim SAITALK conformance
-while omitting the English profile.
+SAITALK conformance requires `chat_style=caveman-ded-en`. No other chat style
+is valid.
 
 ## 3. Universal design
 
@@ -100,7 +100,7 @@ A person can use SAITALK without an agent framework:
 
 1. Keep the directory with the project or notes.
 2. Paste `adapters/GENERIC_SYSTEM_PROMPT.md` into a custom instruction field.
-3. Attach `SAITALK.md` and `saitalk.conf` when starting a session.
+3. Attach `SKILL.md`, `SAITALK.md`, and `saitalk.conf` when starting a session.
 4. Run the validator after changing either file.
 5. Store the current `contract_id` in long-running task state.
 

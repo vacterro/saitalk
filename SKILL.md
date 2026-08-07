@@ -79,19 +79,19 @@ host-native equivalent. The field names and values above remain exact.
 Validate with:
 
 ```powershell
-py scripts\saitalk.py validate --state STATE.md
+py scripts/saitalk.py validate --state STATE.md
 ```
 
 After editing `SAITALK.md` or `saitalk.conf`, refresh the marker:
 
 ```powershell
-py scripts\saitalk.py refresh
+py scripts/saitalk.py refresh
 ```
 
 ## Suspension
 
 `stop caveman` or `normal mode` suspends only the configured chat voice.
 
-Truthfulness, evidence gates, exact technical text, artifact boundaries,
-protocol priority, and safety behavior remain active. Restore voice only on
-explicit request.
+Truthfulness, evidence gates, exact technical text, completion-first behavior,
+artifact boundaries, protocol priority, and safety behavior remain active.
+Restore voice only on explicit request.

@@ -11,7 +11,7 @@ from pathlib import Path
 
 SENTINEL = "<SAITALK-CONTRACT>"
 CONTRACT_PATTERN = re.compile(r"(?m)^contract_id\s*[:=]\s*(\S+)\s*$")
-CONF_PATTERN = re.compile(r"(?m)^([a-z_]+)=(\S.*|\S*)$")
+CONF_PATTERN = re.compile(r"(?m)^([a-z_]+)=(\S.*)$")
 STATE_PATTERN = re.compile(r"(?m)^saitalk_contract:\s*(\S+)\s*$")
 STATE_STATUS_PATTERN = re.compile(r"(?m)^saitalk_status:\s*(\S+)\s*$")
 
@@ -240,4 +240,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())

@@ -1,16 +1,13 @@
 from __future__ import annotations
 
-import importlib.util
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-
-SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "saitalk.py"
-SPEC = importlib.util.spec_from_file_location("saitalk", SCRIPT)
-assert SPEC and SPEC.loader
-module = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(module)
+SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
+sys.path.insert(0, str(SCRIPTS))
+import saitalk  # noqa: E402
 
 
 class SaitalkTests(unittest.TestCase):
@@ -39,8 +36,8 @@ class SaitalkTests(unittest.TestCase):
             root = Path(temp)
             contract, conf = self.create_files(root)
 
-            expected = module.refresh(contract, conf)
-            actual, config = module.validate(contract, conf)
+            expected = saitalk.refresh(contract, conf)
+            actual, config = saitalk.validate(contract, conf)
 
             self.assertEqual(actual, expected)
             self.assertEqual(config["reply_language"], "en")
@@ -50,7 +47,7 @@ class SaitalkTests(unittest.TestCase):
                 f"saitalk_contract: {expected}\nsaitalk_status: active\n",
                 encoding="utf-8",
             )
-            module.validate_state(state, expected)
+            saitalk.validate_state(state, expected)
 
     def test_invalid_language_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -60,8 +57,8 @@ class SaitalkTests(unittest.TestCase):
                 "reply_language=en", "reply_language=eesti"
             )
             conf.write_text(text, encoding="utf-8")
-            with self.assertRaises(module.SaitalkError):
-                module.validate(contract, conf)
+            with self.assertRaises(saitalk.SaitalkError):
+                saitalk.validate(contract, conf)
 
     def test_stale_state_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -71,8 +68,8 @@ class SaitalkTests(unittest.TestCase):
                 "saitalk_contract: saitalk-deadbeef\n",
                 encoding="utf-8",
             )
-            with self.assertRaises(module.SaitalkError):
-                module.validate_state(state, "saitalk-12345678")
+            with self.assertRaises(saitalk.SaitalkError):
+                saitalk.validate_state(state, "saitalk-12345678")
 
     def test_inactive_status_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -83,8 +80,8 @@ class SaitalkTests(unittest.TestCase):
                 "saitalk_status: inactive\n",
                 encoding="utf-8",
             )
-            with self.assertRaises(module.SaitalkError):
-                module.validate_state(state, "saitalk-12345678")
+            with self.assertRaises(saitalk.SaitalkError):
+                saitalk.validate_state(state, "saitalk-12345678")
 
     def test_active_status_passes(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -95,7 +92,7 @@ class SaitalkTests(unittest.TestCase):
                 "saitalk_status: active\n",
                 encoding="utf-8",
             )
-            module.validate_state(state, "saitalk-12345678")
+            saitalk.validate_state(state, "saitalk-12345678")
 
 
 if __name__ == "__main__":
