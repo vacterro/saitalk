@@ -32,7 +32,9 @@ SAITALK/
 ├── tests/
 │   └── test_saitalk.py
 ├── evals/
-│   └── cases.json
+│   ├── cases.json
+│   ├── README.md
+│   └── harness.py
 ├── examples/
 │   └── STATE.md
 ├── CHANGELOG.md
@@ -126,9 +128,21 @@ a plain folder with one stubborn human and too many markdown files.
 py -m unittest discover -s tests -v
 ```
 
+## Run the eval harness
+
+```powershell
+py -m evals.harness validate
+py -m evals.harness export --out evals/export.json
+py -m evals.harness init-results --out evals/results.json
+```
+
+Results use explicit `PASS`, `FAIL`, `SKIP`, and `NOT_RUN` states. Behavioral
+conformance is claimed only when a real model/host run recorded results;
+unrun cases stay `NOT_RUN`. See [evals/README.md](evals/README.md).
+
 ## Version
 
-Current release: 0.1.6. See [CHANGELOG.md](CHANGELOG.md).
+Current release: 0.1.7. See [CHANGELOG.md](CHANGELOG.md).
 
 ## Core behavior
 

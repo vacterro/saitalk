@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.1.7 - 2026-08-07
+
+- Evals became an honest, executable harness (`evals/harness.py`): schema
+  validation (version 1, unique case IDs, required `setup`/`prompt`/`must`/
+  `must_not`), deterministic case export for a host/model runner, and a
+  machine-readable `results.json` with explicit `PASS`, `FAIL`, `SKIP`, and
+  `NOT_RUN` states.
+- Rewrote `evals/cases.json` to 17 behavioral cases, including fixed `en`/
+  `et`/`ru`, auto language selection, quoted foreign text not changing chat
+  language, artifact language independent from chat, zero-finding review,
+  preference not blocking completion, destructive precheck, standalone
+  suspension, quoted `normal mode` not suspending, explicit resume, suspended
+  voice surviving handoff, and no persona leakage into artifacts.
+- Added `evals/README.md` and a `NOT_RUN` result policy: behavioral
+  conformance is claimed only when a real model/host run recorded results.
+- No model run was performed in this wave; the eval corpus is recorded as
+  `NOT_RUN`, not `PASS`.
+
 ## 0.1.6 - 2026-08-07
 
 - Expanded the regression suite from 5 tests to 34, organized as config,

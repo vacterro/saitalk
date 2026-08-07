@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 import tempfile
@@ -462,6 +463,68 @@ class CanonicalSuiteTests(unittest.TestCase):
     def test_package_validates(self) -> None:
         proc = run_cli("validate")
         self.assertEqual(proc.returncode, 0, proc.stderr)
+
+
+class EvalHarnessTests(unittest.TestCase):
+    from evals import harness as evals_harness
+
+    def test_shipped_cases_schema_valid(self) -> None:
+        data = self.evals_harness.load_cases(REPO / "evals" / "cases.json")
+        self.assertEqual(data["version"], 1)
+        self.assertGreaterEqual(len(data["cases"]), 15)
+
+    def test_unique_ids(self) -> None:
+        data = self.evals_harness.load_cases(REPO / "evals" / "cases.json")
+        ids = [case["id"] for case in data["cases"]]
+        self.assertEqual(len(ids), len(set(ids)))
+
+    def test_duplicate_id_fails(self) -> None:
+        data = self.evals_harness.load_cases(REPO / "evals" / "cases.json")
+        data["cases"].append(dict(data["cases"][0]))
+        with self.assertRaises(self.evals_harness.EvalError) as ctx:
+            self.evals_harness.validate_cases(data)
+        self.assertIn("duplicate case id", str(ctx.exception))
+
+    def test_missing_required_field_fails(self) -> None:
+        data = {
+            "version": 1,
+            "cases": [{"id": "c1", "prompt": "p", "must": ["x"], "must_not": ["y"]}],
+        }
+        with self.assertRaises(self.evals_harness.EvalError) as ctx:
+            self.evals_harness.validate_cases(data)
+        self.assertIn("setup", str(ctx.exception))
+
+    def test_export_is_deterministic(self) -> None:
+        data = self.evals_harness.load_cases(REPO / "evals" / "cases.json")
+        first = self.evals_harness.export_cases(data)
+        second = self.evals_harness.export_cases(data)
+        self.assertEqual(first, second)
+
+    def test_results_states(self) -> None:
+        data = self.evals_harness.load_cases(REPO / "evals" / "cases.json")
+        results = self.evals_harness.new_results(data)
+        self.assertEqual(set(results.values()), {"NOT_RUN"})
+        for state in results.values():
+            self.assertIn(state, self.evals_harness.EVAL_STATES)
+
+    def test_invalid_result_state_fails(self) -> None:
+        data = self.evals_harness.load_cases(REPO / "evals" / "cases.json")
+        results = self.evals_harness.new_results(data)
+        results[data["cases"][0]["id"]] = "MAYBE"
+        with tempfile.TemporaryDirectory() as temp:
+            with self.assertRaises(self.evals_harness.EvalError) as ctx:
+                self.evals_harness.write_results(results, Path(temp) / "results.json")
+            self.assertIn("invalid result state", str(ctx.exception))
+
+    def test_write_results_roundtrip(self) -> None:
+        data = self.evals_harness.load_cases(REPO / "evals" / "cases.json")
+        results = self.evals_harness.new_results(data)
+        results[data["cases"][0]["id"]] = "PASS"
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "results.json"
+            self.evals_harness.write_results(results, path)
+            written = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(written["results"], dict(sorted(results.items())))
 
 
 if __name__ == "__main__":

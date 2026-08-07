@@ -147,4 +147,5 @@ SAITALK cannot force compliance in a host that ignores supplied instructions.
 
 Validation proves file integrity and state freshness. It does not prove that a
 model actually obeyed every response rule. Behavioral evals cover that second
-problem.
+problem, and only a recorded model/host run may claim `PASS`; unrun cases stay
+`NOT_RUN` (evals/README.md).
