@@ -573,14 +573,14 @@ class RefreshTests(unittest.TestCase):
             self.assertIn("same file", str(ctx.exception))
 
     def _fail_write(self, fail_at: int):
-        original = saitalk._write_temp
+        original = saitalk._safe_write_temp
         calls = {"n": 0}
 
-        def wrapper(target, content):
+        def wrapper(target, data, mode=None):
             calls["n"] += 1
             if calls["n"] == fail_at:
                 raise saitalk.SaitalkError("simulated write failure")
-            return original(target, content)
+            return original(target, data, mode=mode)
 
         return wrapper
 
@@ -612,10 +612,10 @@ class RefreshTests(unittest.TestCase):
             self.assertFalse((root / "saitalk.conf.tmp").exists())
 
     def test_rollback_first_write(self) -> None:
-        self._assert_rollback("scripts.saitalk._write_temp", self._fail_write(1))
+        self._assert_rollback("scripts.saitalk._safe_write_temp", self._fail_write(1))
 
     def test_rollback_second_write(self) -> None:
-        self._assert_rollback("scripts.saitalk._write_temp", self._fail_write(2))
+        self._assert_rollback("scripts.saitalk._safe_write_temp", self._fail_write(2))
 
     def test_rollback_replacement(self) -> None:
         self._assert_rollback("scripts.saitalk._replace_temp", self._fail_replace(2))
@@ -625,7 +625,7 @@ class RefreshTests(unittest.TestCase):
             root = Path(temp)
             contract, conf, skill = make_root(root)
             with unittest.mock.patch(
-                "scripts.saitalk._write_temp", side_effect=self._fail_write(1)
+                "scripts.saitalk._safe_write_temp", side_effect=self._fail_write(1)
             ), self.assertRaises(saitalk.SaitalkError):
                 saitalk.refresh(contract, conf, skill)
             expected = saitalk.refresh(contract, conf, skill)
@@ -646,11 +646,11 @@ class RefreshTests(unittest.TestCase):
                     raise saitalk.SaitalkError("simulated replacement failure")
                 return original_replace(target, tmp)
 
-            def fail_restore_contract(target, original):
+            def fail_restore_contract(target, original, mode=None):
                 restore_attempts.append(target)
                 if target == contract:
                     raise saitalk.SaitalkError("simulated restore failure")
-                return original_restore(target, original)
+                return original_restore(target, original, mode=mode)
 
             with unittest.mock.patch(
                 "scripts.saitalk._replace_temp", side_effect=fail_second_replace
@@ -671,10 +671,9 @@ class RefreshTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             contract, conf, skill = make_root(root)
-            with unittest.mock.patch(
-                "scripts.saitalk._restore_bytes", wraps=saitalk._restore_bytes
+            with unittest.mock.patch("scripts.saitalk._restore_bytes", wraps=saitalk._restore_bytes
             ) as restore_spy, unittest.mock.patch(
-                "scripts.saitalk._write_temp", side_effect=self._fail_write(1)
+                "scripts.saitalk._safe_write_temp", side_effect=self._fail_write(1)
             ), self.assertRaises(saitalk.SaitalkError):
                 saitalk.refresh(contract, conf, skill)
             restore_spy.assert_not_called()
@@ -683,10 +682,9 @@ class RefreshTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             contract, conf, skill = make_root(root)
-            with unittest.mock.patch(
-                "scripts.saitalk._restore_bytes", wraps=saitalk._restore_bytes
+            with unittest.mock.patch("scripts.saitalk._restore_bytes", wraps=saitalk._restore_bytes
             ) as restore_spy, unittest.mock.patch(
-                "scripts.saitalk._write_temp", side_effect=self._fail_write(2)
+                "scripts.saitalk._safe_write_temp", side_effect=self._fail_write(2)
             ), self.assertRaises(saitalk.SaitalkError):
                 saitalk.refresh(contract, conf, skill)
             restore_spy.assert_not_called()
@@ -1294,7 +1292,7 @@ class DriftTests(unittest.TestCase):
             with self.assertRaises(saitalk.SaitalkError) as ctx:
                 saitalk.validate_drift(root)
             self.assertIn("drift", str(ctx.exception))
-            self.assertIn("completion first", str(ctx.exception))
+            self.assertIn("completion-first", str(ctx.exception))
 
     def test_multiline_split_token_reports_first_word_line(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

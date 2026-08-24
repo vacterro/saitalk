@@ -5,8 +5,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -183,12 +185,23 @@ def write_results(
         },
         "results": dict(sorted(results.items())),
     }
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(
-        json.dumps(payload, ensure_ascii=True, sort_keys=True, indent=2) + "\n",
-        encoding="utf-8",
+    # CORE-001: use a unique temporary file created with mkstemp so no
+    # pre-existing hardlink/symlink at <path>.tmp can be followed.
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(path.parent), prefix=path.name + "."
     )
-    tmp.replace(path)
+    tmp = Path(tmp_path)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=True, sort_keys=True, indent=2)
+            fh.write("\n")
+        tmp.replace(path)
+    except BaseException:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def load_results(path: Path, cases: dict[str, Any]) -> dict[str, Any]:
@@ -252,6 +265,10 @@ def _resolve_saitalk_paths(args: argparse.Namespace):
 def current_contract_id(args: argparse.Namespace) -> tuple[str | None, str | None]:
     """Return (contract_id, error) for the active local SAITALK package.
 
+    CORE-004 / W2-003: uses the canonical validate_package entry point
+    (which includes adapter drift validation) so that a package rejected
+    by SAITALK's own validators is never reported as "current".
+
     Never raises: a package that fails to validate just means "current"
     cannot be established, which the caller reports as such rather than
     crashing the results check.
@@ -260,7 +277,7 @@ def current_contract_id(args: argparse.Namespace) -> tuple[str | None, str | Non
         from scripts import saitalk as _saitalk
 
         contract_path, conf_path, skill_path = _resolve_saitalk_paths(args)
-        contract_id, _ = _saitalk.validate(contract_path, conf_path, skill_path)
+        contract_id, _ = _saitalk.validate_package(contract_path, conf_path, skill_path)
         return contract_id, None
     except Exception as exc:  # noqa: BLE001 - reported, never crashes the CLI
         return None, str(exc)
