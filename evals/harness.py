@@ -86,23 +86,27 @@ def validate_cases(data: Any) -> None:
             if field in ("setup", "prompt"):
                 if not isinstance(value, str) or not value.strip():
                     raise EvalError(f"case {cid}: {field} must be a non-empty string")
-            else:
-                if (
-                    not isinstance(value, list)
-                    or not value
-                    or not all(isinstance(item, str) and item.strip() for item in value)
-                ):
-                    raise EvalError(
-                        f"case {cid}: {field} must be a non-empty list of non-empty strings"
-                    )
-                normalized = [_norm(item) for item in value]
-                if len(set(normalized)) != len(normalized):
-                    raise EvalError(
-                        f"case {cid}: {field} contains duplicate entries"
-                    )
-        overlap = {_norm(item) for item in case["must"]} & {
-            _norm(item) for item in case["must_not"]
-        }
+        # PERF-002: normalize each must / must_not item exactly once into a
+        # retained set; detect duplicates while building and compute the
+        # overlap directly from the two sets (no throwaway second pass).
+        must_set: set[str] = set()
+        must_not_set: set[str] = set()
+        for field, target in (("must", must_set), ("must_not", must_not_set)):
+            value = case.get(field)
+            if (
+                not isinstance(value, list)
+                or not value
+                or not all(isinstance(item, str) and item.strip() for item in value)
+            ):
+                raise EvalError(
+                    f"case {cid}: {field} must be a non-empty list of non-empty strings"
+                )
+            for item in value:
+                norm = _norm(item)
+                if norm in target:
+                    raise EvalError(f"case {cid}: {field} contains duplicate entries")
+                target.add(norm)
+        overlap = must_set & must_not_set
         if overlap:
             raise EvalError(
                 f"case {cid}: must and must_not overlap on: "
@@ -183,8 +187,20 @@ def write_results(
             "cases": len(cases["cases"]),
             "digest": corpus_digest(cases),
         },
-        "results": dict(sorted(results.items())),
+        # PERF-003: assign the results mapping directly; json.dump already
+        # sorts keys deterministically, so the redundant full-copy pre-sort
+        # added nothing but O(n log n) work and O(n) transient memory.
+        "results": results,
     }
+    # W2-005: preserve destination metadata and refuse to sever symlinks.
+    if path.is_symlink():
+        raise EvalError(f"write_results refuses to replace symlink destination: {path}")
+    existing_mode = None
+    if os.name != "nt" and path.is_file():
+        try:
+            existing_mode = os.stat(path).st_mode & 0o7777
+        except OSError:
+            existing_mode = None
     # CORE-001: use a unique temporary file created with mkstemp so no
     # pre-existing hardlink/symlink at <path>.tmp can be followed.
     fd, tmp_path = tempfile.mkstemp(
@@ -192,6 +208,11 @@ def write_results(
     )
     tmp = Path(tmp_path)
     try:
+        if existing_mode is not None:
+            try:
+                os.fchmod(fd, existing_mode)
+            except OSError:
+                pass
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, ensure_ascii=True, sort_keys=True, indent=2)
             fh.write("\n")
@@ -262,25 +283,19 @@ def _resolve_saitalk_paths(args: argparse.Namespace):
     )
 
 
-def current_contract_id(args: argparse.Namespace) -> tuple[str | None, str | None]:
-    """Return (contract_id, error) for the active local SAITALK package.
+def current_contract_id(args: argparse.Namespace) -> str:
+    """Return the active local SAITALK package's contract_id.
 
-    CORE-004 / W2-003: uses the canonical validate_package entry point
-    (which includes adapter drift validation) so that a package rejected
-    by SAITALK's own validators is never reported as "current".
-
-    Never raises: a package that fails to validate just means "current"
-    cannot be established, which the caller reports as such rather than
-    crashing the results check.
+    W2-004: any failure to establish or validate the active package is
+    raised, not swallowed, so callers (validate-results) can report a nonzero
+    status instead of a misleading VALID.  Expected validation failures
+    (``SaitalkError``) and unexpected errors both propagate.
     """
-    try:
-        from scripts import saitalk as _saitalk
+    from scripts import saitalk as _saitalk
 
-        contract_path, conf_path, skill_path = _resolve_saitalk_paths(args)
-        contract_id, _ = _saitalk.validate_package(contract_path, conf_path, skill_path)
-        return contract_id, None
-    except Exception as exc:  # noqa: BLE001 - reported, never crashes the CLI
-        return None, str(exc)
+    contract_path, conf_path, skill_path = _resolve_saitalk_paths(args)
+    contract_id, _ = _saitalk.validate_package(contract_path, conf_path, skill_path)
+    return contract_id
 
 
 def main() -> int:
@@ -297,6 +312,11 @@ def main() -> int:
     init_parser = sub.add_parser("init-results", help="Write a NOT_RUN result file.")
     init_parser.add_argument("--cases", type=Path, default=None)
     init_parser.add_argument("--out", type=Path, default=None)
+    init_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite an existing results file even if it holds recorded evidence.",
+    )
 
     results_parser = sub.add_parser(
         "validate-results",
@@ -332,6 +352,32 @@ def main() -> int:
             data = load_cases(cases_path)
             results = new_results(data)
             out = args.out or cases_path.with_name("results.json")
+            if out.exists() and not getattr(args, "force", False):
+                # W2-003: non-destructive by default.  Refuse to clobber
+                # recorded evidence; an identical all-NOT_RUN init is a no-op.
+                try:
+                    existing = load_results(out, data)
+                except (EvalError, OSError, json.JSONDecodeError):
+                    existing = None
+                if (
+                    existing is not None
+                    and existing.get("version") == 1
+                    and existing.get("schema") == "saitalk-eval-results"
+                ):
+                    recorded = any(
+                        r["state"] != "NOT_RUN" for r in existing["results"].values()
+                    )
+                    if (
+                        not recorded
+                        and existing["results"] == results
+                        and existing.get("corpus", {}).get("digest") == corpus_digest(data)
+                    ):
+                        print(f"EVALS RESULTS: {out} (already initialized, no-op)")
+                        return 0
+                raise EvalError(
+                    f"init-results: refusing to overwrite existing results file "
+                    f"{out}; use --force to reset recorded evidence"
+                )
             write_results(results, out, data)
             print(f"EVALS RESULTS: {out} ({len(results)} cases NOT_RUN)")
             return 0
@@ -346,22 +392,23 @@ def main() -> int:
                     f"{results_path}"
                 )
                 return 0
-            active_id, active_error = current_contract_id(args)
-            if active_id is not None and bound_id == active_id:
+            try:
+                active_id = current_contract_id(args)
+            except Exception as exc:  # noqa: BLE001 - reported, never VALID
+                print(
+                    f"EVALS FAIL: active package could not be validated: {exc}",
+                    file=sys.stderr,
+                )
+                return 1
+            if bound_id == active_id:
                 print(
                     f"EVALS RESULTS CURRENT: {results_path} bound to the active "
                     f"validated contract_id={bound_id}"
                 )
-            elif active_id is not None:
+            else:
                 print(
                     f"EVALS RESULTS VALID (historical, NOT current): {results_path} "
                     f"bound to contract_id={bound_id!r}, active package is {active_id!r}"
-                )
-            else:
-                print(
-                    f"EVALS RESULTS VALID (schema-valid only; active package could not "
-                    f"be validated: {active_error}): {results_path} bound to "
-                    f"contract_id={bound_id!r}"
                 )
             return 0
     except (EvalError, OSError) as exc:

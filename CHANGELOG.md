@@ -1,5 +1,62 @@
 # Changelog
 
+## 0.1.10 - 2026-08-26
+
+Audit-driven repair release. Every item below has a red control in the test
+suite (`AuditRepairRegressionTests`). The prior "13 repairs" commit had left
+several fixes half-broken; this release re-implements and pins each one.
+
+### Correctness repairs (Core / Second Wave)
+
+- Release identity advanced to 0.1.10; VERSION, README current-release, and
+  this changelog heading agree (CORE-001).
+- Markdown top-level visibility scanner fixed: same-line HTML comments no
+  longer hide a live heading that precedes them, four-space-indented
+  pseudo-fences cannot mask a real heading, and a backtick-opener carrying a
+  backtick in its info string is treated as live text (CORE-002).
+- Drift validation now follows directory symlinks by recursive descent with a
+  cycle guard, so an adapter subtree reachable only through a symlinked
+  directory can no longer evade the guard (CORE-003 / CORE-007).
+- Drift diagnostics now report the source line of the *matched* banned phrase
+  via a character-to-line map, not the first occurrence of the token's first
+  word (CORE-007).
+- Refresh no longer reinterprets an `os.stat` failure as "no mode to preserve";
+  a stat failure on a target it must replace now aborts cleanly (CORE-004).
+- Staging failures (mkstemp / fchmod / write / fsync / replace) are normalized
+  into `SaitalkError` with the target and operation context, so the public
+  `refresh`/CLI error contract stays uniform instead of leaking a raw
+  `OSError` traceback (CORE-005).
+- Artifact-language resolver now implements the full BCP 47 grammar
+  (primary/extlang/script/region/variants/extensions/private-use), so any
+  well-formed explicit tag is honored (CORE-006).
+- Package validation now runs drift against the *logical* supplied package
+  root (the directory holding the supplied manifest members), never the
+  resolved referent's parent, so a symlinked manifest cannot make a logical
+  package's own adapters evade validation (W2-001).
+- Coherent-snapshot locking: resolved referents are captured once and used for
+  every read/write/replace/rollback, and re-checked for stability before
+  returning, so a retargeted symlink aborts instead of reporting a stale
+  package (W2-002).
+- Eval harness `init-results` is now non-destructive: it refuses to overwrite
+  an existing results file (recorded evidence) unless `--force` is given, and
+  treats an identical all-NOT_RUN init as a no-op (W2-003).
+- `validate-results` now fails (nonzero, `EVALS FAIL`) when the active package
+  cannot be validated, instead of swallowing the error and reporting a bogus
+  VALID (W2-004).
+- `write_results` refuses to replace a symlink destination and preserves the
+  destination's POSIX mode bits on the staged temp file (W2-005).
+
+### Performance (PERF)
+
+- Structural validation parses the live contract exactly once; headings and
+  sections 11/12 are derived from that single representation (PERF-001).
+- `validate_cases` normalizes each `must`/`must_not` item exactly once into a
+  retained set and computes the overlap directly, with no throwaway second
+  normalization pass (PERF-002).
+- `write_results` assigns the results mapping directly; `json.dump` already
+  sorts deterministically, so the redundant full-copy pre-sort is gone
+  (PERF-003).
+
 ## 0.1.9 - 2026-08-07
 
 Surgical fix/hunt wave over the v0.1.8 baseline. Every item below has a red

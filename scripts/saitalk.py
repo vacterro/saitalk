@@ -46,16 +46,52 @@ CANONICAL_SECTIONS = (
     "Configuration reference",
 )
 SECTION_COUNT = len(CANONICAL_SECTIONS)
-# W2-005: well-formed language tags covering primary + optional
-# extlang/script/region/variant/extension/private-use subtags.
-LANGUAGE_TAG = re.compile(
-    r"^[a-z]{2,3}"
-    r"(?:-[a-z]{4})?"
-    r"(?:-(?:[a-z]{2}|[0-9]{3}))?"
-    r"(?:-[a-z0-9]{5,8}|[0-9][a-z0-9]{3})*"
-    r"(?:-[a-wyz](?:-[a-z0-9]{2,8})+)*"
-    r"(?:-x(?:-[a-z0-9]{1,8})+)?$"
-)
+# CORE-006: complete zero-dependency well-formed language-tag grammar
+# (BCP 47 regular production).  Covers primary language, optional extlang,
+# script, region, variants, extensions and private-use subtags, plus the
+# private-use-only form.  This matches the contract's promise that any
+# well-formed explicit language tag is honored.
+def _is_well_formed_language_tag(tag: str) -> bool:
+    # BCP 47 tags are case-insensitive; normalize so subtag comparisons are
+    # always lowercase (e.g. en-US, zh-cmn-Hans-CN, zh-CN).
+    parts = tag.casefold().split("-")
+    if not parts or any(not p for p in parts):
+        return False
+    primary = parts[0]
+    if not re.fullmatch(r"[a-z]{2,3}", primary):
+        # private-use-only form: x + one or more privateuse subtags
+        if primary == "x":
+            return len(parts) >= 2 and all(
+                re.fullmatch(r"[a-z0-9]{1,8}", p) for p in parts[1:]
+            )
+        return False
+    idx = 1
+    if idx < len(parts) and re.fullmatch(r"[a-z]{3}", parts[idx]):  # extlang
+        idx += 1
+    if idx < len(parts) and re.fullmatch(r"[a-z]{4}", parts[idx]):  # script
+        idx += 1
+    if idx < len(parts) and (
+        re.fullmatch(r"[a-z]{2}", parts[idx]) or re.fullmatch(r"[0-9]{3}", parts[idx])
+    ):  # region
+        idx += 1
+    while idx < len(parts) and (
+        re.fullmatch(r"[a-z0-9]{5,8}", parts[idx])
+        or re.fullmatch(r"[0-9][a-z0-9]{3}", parts[idx])
+    ):  # variants
+        idx += 1
+    while idx < len(parts) and re.fullmatch(r"[a-wyz]", parts[idx]):  # extension singleton
+        idx += 1
+        if idx >= len(parts):
+            return False
+        while idx < len(parts) and re.fullmatch(r"[a-z0-9]{2,8}", parts[idx]):
+            idx += 1
+    if idx < len(parts) and parts[idx] == "x":  # privateuse
+        idx += 1
+        if idx >= len(parts):
+            return False
+        while idx < len(parts) and re.fullmatch(r"[a-z0-9]{1,8}", parts[idx]):
+            idx += 1
+    return idx == len(parts)
 
 VOICE_STOP = {"stop caveman", "normal mode"}
 VOICE_RESUME = {"resume caveman", "saitalk mode"}
@@ -190,19 +226,23 @@ def normalize(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _top_level_lines(text: str) -> str:
-    """Return only lines outside fenced code blocks (``` or ~~~) and HTML
-    comments.
+    """Return only the *live* top-level lines of *text*.
 
-    Changes vs. prior implementation:
+    A line is live when it is outside fenced code blocks (``` or ~~~) and
+    outside HTML comments.  The following Markdown boundaries are honoured
+    (CORE-002):
 
-    * **Inline comments** – an HTML comment that begins anywhere on a line
-      (not only at the start) is recognised.  Any text before ``<!--`` on
-      the same line is retained; text after the closing ``-->`` is kept
-      and recursed through.
-    * **Fence closing** – a closing fence must use the *same delimiter
-      character* and contain *at least as many consecutive delimiter
-      characters* as the opening fence (e.g. `````` is closed by
-      `````` but not by ```).
+    * **Fenced blocks** – a fence opener must begin with 0-3 leading spaces
+      and use 3+ identical backticks or tildes; a backtick opener may not
+      carry a backtick inside its info string (that is not a valid fence).
+      A closing fence must use the same delimiter character and at least as
+      many delimiter characters as the opener.  Four-space indented code is
+      an indented-code construct, never a fence, so it cannot mask live
+      headings.
+    * **HTML comments** – both ``<!--`` ... ``-->`` spanning multiple lines
+      and same-line comments are recognised.  Any live text *before* an
+      inline comment and *after* its closing ``-->`` is preserved, so an
+      inline comment can never hide a live heading that precedes it.
     """
     kept: list[str] = []
     fence_char: str | None = None
@@ -212,16 +252,16 @@ def _top_level_lines(text: str) -> str:
     for line in text.splitlines():
         remaining = line
 
-        # --- inside a multi-line HTML comment: skip until --> ----------
+        # Inside a multi-line HTML comment: drop until the closing marker.
         if in_comment:
             close_idx = remaining.find("-->")
             if close_idx == -1:
                 continue
             in_comment = False
             remaining = remaining[close_idx + 3:]
-            # fall through to process the rest of the line below
+            # fall through to continue scanning the rest of the line
 
-        # --- inside a fenced block: look for a matching close ---------
+        # Inside a fenced block: only look for a valid closing fence.
         if fence_char is not None:
             stripped = remaining.strip()
             m = FENCE_PATTERN.match(stripped)
@@ -230,47 +270,50 @@ def _top_level_lines(text: str) -> str:
                 fence_len = 0
             continue
 
-        # --- scan for inline HTML comments (may appear anywhere) -------
+        # Scan for inline HTML comments; keep live text before and after.
         while True:
             comment_start = remaining.find("<!--")
             if comment_start == -1:
                 break
-            # text before the comment is live
             before = remaining[:comment_start]
             after_open = remaining[comment_start + 4:]
             close_idx = after_open.find("-->")
             if close_idx == -1:
-                # comment extends to subsequent lines
+                # Comment runs to subsequent lines.
                 if before.strip():
                     kept.append(before)
                 in_comment = True
                 remaining = ""
                 break
-            # comment closes on the same line
-            remaining = after_open[close_idx + 3:]
+            # Comment closes on the same line: preserve before + after.
+            remaining = before + after_open[close_idx + 3:]
 
         if not remaining:
-            if remaining is not None and not in_comment:
-                # line was entirely consumed by an inline comment (e.g.
-                # "<!-- ... -->" alone) – skip it
-                pass
             continue
 
-        # --- check for fenced block opening ----------------------------
-        stripped = remaining.strip()
-        m = FENCE_PATTERN.match(stripped)
-        if m:
-            fence_char = m.group(1)[0]
-            fence_len = len(m.group(1))
-            continue
+        # Fence opener detection: Markdown requires 0-3 leading spaces.
+        leading = len(remaining) - len(remaining.lstrip(" "))
+        if leading <= 3:
+            stripped = remaining.strip()
+            m = FENCE_PATTERN.match(stripped)
+            if m:
+                opener = m.group(1)
+                if opener[0] == "`":
+                    # A backtick fence info string may not contain a backtick.
+                    if "`" in stripped[len(opener):]:
+                        pass  # invalid opener -> treat the line as live text
+                    else:
+                        fence_char = "`"
+                        fence_len = len(opener)
+                        continue
+                else:
+                    fence_char = "~"
+                    fence_len = len(opener)
+                    continue
 
         kept.append(remaining)
 
     return "\n".join(kept)
-
-
-def _top_level_headings(text: str) -> list[str]:
-    return [m.group(1).rstrip() for m in TOP_HEADING_PATTERN.finditer(_top_level_lines(text))]
 
 
 # ---------------------------------------------------------------------------
@@ -402,8 +445,12 @@ def replace_id_bytes(data: bytes, new_id: str, label: str) -> bytes:
     return prefix + new_body
 
 
-def _section_body(text: str, num: int) -> str:
-    lines = _top_level_lines(text).splitlines()
+def _headings_from_live(live: str) -> list[str]:
+    return [m.group(1).rstrip() for m in TOP_HEADING_PATTERN.finditer(live)]
+
+
+def _section_body_from_live(live: str, num: int) -> str:
+    lines = live.splitlines()
     start = None
     end = len(lines)
     for i, line in enumerate(lines):
@@ -419,17 +466,24 @@ def _section_body(text: str, num: int) -> str:
 
 
 def check_structure(contract_text: str, skill_text: str) -> None:
-    """Minimal structural conformance guards for the normative contract."""
+    """Minimal structural conformance guards for the normative contract.
+
+    PERF-001: the live contract structure is parsed exactly once; headings and
+    sections 11/12 are derived from that single representation, not by
+    re-scanning the whole contract three more times.
+    """
     normalized = normalize(contract_text)
-    headings = _top_level_headings(normalized)
+    # PERF-001: one live-contract parse.
+    live = _top_level_lines(normalized)
+    headings = _headings_from_live(live)
     expected_headings = [f"{i}. {title}" for i, title in enumerate(CANONICAL_SECTIONS, 1)]
     if headings != expected_headings:
         raise SaitalkError(
             "contract structure: top-level sections must be exactly "
             f"{expected_headings} in order, found {headings}"
         )
-    section11 = _section_body(normalized, 11)
-    section12 = _section_body(normalized, 12)
+    section11 = _section_body_from_live(live, 11)
+    section12 = _section_body_from_live(live, 12)
     for token in STATE_TOKENS:
         if token not in section11:
             raise SaitalkError(
@@ -523,10 +577,19 @@ def _safe_write_temp(target: Path, data: bytes, mode: int | None = None) -> Path
     """Create a unique temporary file in the same directory as *target*,
     write *data*, flush, fsync, and return the path.  If *mode* is given
     the file descriptor is set to that mode before writing (POSIX).
+
+    CORE-005: any filesystem failure (``mkstemp``, ``fchmod``, write, flush,
+    ``fsync``) is normalized into a ``SaitalkError`` carrying the target and
+    operation context, so the public ``refresh``/CLI error contract stays
+    uniform instead of leaking a raw ``OSError`` traceback.  The descriptor is
+    closed on any failure that happens before ``os.fdopen`` takes ownership.
     """
     dir_path = target.parent
     prefix = f"{target.name}."
-    fd, tmp_path = tempfile.mkstemp(dir=str(dir_path), prefix=prefix)
+    try:
+        fd, tmp_path = tempfile.mkstemp(dir=str(dir_path), prefix=prefix)
+    except OSError as exc:
+        raise SaitalkError(f"staging failure for {target}: {exc}") from exc
     try:
         if mode is not None and os.name != "nt":
             os.fchmod(fd, mode)
@@ -534,12 +597,16 @@ def _safe_write_temp(target: Path, data: bytes, mode: int | None = None) -> Path
             fh.write(data)
             fh.flush()
             os.fsync(fh.fileno())
-    except OSError:
+    except OSError as exc:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
         try:
             os.unlink(tmp_path)
         except OSError:
             pass
-        raise
+        raise SaitalkError(f"staging failure for {target}: {exc}") from exc
     return Path(tmp_path)
 
 
@@ -566,16 +633,21 @@ def _restore_bytes(target: Path, original: bytes, mode: int | None = None) -> No
             pass
 
 
-def _capture_modes(paths: list[Path]) -> dict[Path, int | None]:
-    """Capture POSIX permission bits for each path; returns None for paths
-    that do not yet exist (new files after the first write).
+def _capture_modes(paths: list[Path]) -> dict[Path, int]:
+    """Capture POSIX permission bits for each existing path.
+
+    CORE-004: an ``os.stat`` failure on a target that refresh must replace is
+    a real error, never a signal that the file is new.  Raising here aborts
+    the operation before any byte or mode change, instead of silently
+    presuming "no mode to preserve" and then clobbering the file's
+    permissions on replace.
     """
-    modes: dict[Path, int | None] = {}
+    modes: dict[Path, int] = {}
     for p in paths:
         try:
             modes[p] = os.stat(p).st_mode & 0o7777
-        except OSError:
-            modes[p] = None
+        except OSError as exc:
+            raise SaitalkError(f"cannot read permissions of {p}: {exc}") from exc
     return modes
 
 
@@ -637,9 +709,11 @@ def refresh(contract_path: Path, conf_path: Path, skill_path: Path) -> str:
         new_contract = replace_id_bytes(contract_bytes, new_id, "SAITALK.md contract_id")
         new_conf = replace_id_bytes(conf_bytes, new_id, "saitalk.conf contract_id")
 
-        # W2-002: capture permission bits before any writes
-        mode_contract = _capture_modes([resolved_map["SAITALK.md"]]).get(resolved_map["SAITALK.md"])
-        mode_conf = _capture_modes([resolved_map["saitalk.conf"]]).get(resolved_map["saitalk.conf"])
+        # W2-002 / CORE-004: capture permission bits before any writes; a
+        # stat failure aborts cleanly before any byte or mode change.
+        modes_map = _capture_modes(
+            [resolved_map["SAITALK.md"], resolved_map["saitalk.conf"]]
+        )
 
         # PERF-003: only stage targets whose bytes actually changed.
         pairs: list[tuple[Path, bytes, bytes]] = []
@@ -649,9 +723,8 @@ def refresh(contract_path: Path, conf_path: Path, skill_path: Path) -> str:
             pairs.append((resolved_map["saitalk.conf"], new_conf, conf_bytes))
 
         if not pairs:
+            _assert_manifest_stable((contract_path, conf_path, skill_path), resolved_map)
             return new_id
-
-        modes_map = {resolved_map["SAITALK.md"]: mode_contract, resolved_map["saitalk.conf"]: mode_conf}
 
         temps: dict[Path, Path] = {}
         replaced: list[Path] = []
@@ -681,6 +754,7 @@ def refresh(contract_path: Path, conf_path: Path, skill_path: Path) -> str:
                     tmp.unlink(missing_ok=True)
                 except OSError:
                     pass
+        _assert_manifest_stable((contract_path, conf_path, skill_path), resolved_map)
         return new_id
     finally:
         _release_locks(locks)
@@ -690,9 +764,53 @@ def refresh(contract_path: Path, conf_path: Path, skill_path: Path) -> str:
 # validate (CORE-005: acquires manifest locks for coherent snapshot)
 # ---------------------------------------------------------------------------
 
-def _validate(contract_path: Path, conf_path: Path, skill_path: Path) -> tuple[str, dict[str, str]]:
-    """Validate manifest without acquiring locks (caller must hold them)."""
-    manifest = read_manifest(contract_path, conf_path, skill_path)
+def _resolved_manifest_map(
+    contract_path: Path, conf_path: Path, skill_path: Path
+) -> dict[str, Path]:
+    """Resolve each manifest member exactly once and return label -> resolved
+    path.  This is the single stable identity used for the whole operation.
+    """
+    _require_coherent_root(contract_path, conf_path, skill_path)
+    resolved: dict[str, Path] = {}
+    for label, path in _manifest_members(contract_path, conf_path, skill_path):
+        resolved[label] = path.resolve()
+    return resolved
+
+
+def _assert_manifest_stable(
+    logical: tuple[Path, Path, Path], resolved: dict[str, Path]
+) -> None:
+    """W2-002: after locks are held and all reads/writes used *resolved*,
+    re-resolve the logical members and require them to still identify the
+    captured targets.  A retargeted symlink means we would report a package
+    the caller no longer points at, so we abort cleanly instead.
+    """
+    for label, logical_path in zip(RUNTIME_MANIFEST, logical):
+        if logical_path.resolve() != resolved[label]:
+            raise SaitalkError(
+                f"manifest member {label} was retargeted during the operation; "
+                "aborting to avoid reporting a stale package"
+            )
+
+
+def _read_resolved_manifest(resolved: dict[str, Path]) -> dict[str, str]:
+    """Read each resolved manifest member exactly once (W2-002 stable set)."""
+    manifest: dict[str, str] = {}
+    for label in RUNTIME_MANIFEST:
+        manifest[label] = read_text(resolved[label])
+    return manifest
+
+
+# ---------------------------------------------------------------------------
+# validate (CORE-005 / W2-002: coherent snapshot)
+# ---------------------------------------------------------------------------
+
+def _validate(resolved: dict[str, Path]) -> tuple[str, dict[str, str]]:
+    """Validate manifest read through the captured resolved referents.
+
+    Caller must hold the locks for *resolved*.
+    """
+    manifest = _read_resolved_manifest(resolved)
     config = parse_conf(manifest["saitalk.conf"])
     check_structure(manifest["SAITALK.md"], manifest["SKILL.md"])
 
@@ -714,12 +832,13 @@ def _validate(contract_path: Path, conf_path: Path, skill_path: Path) -> tuple[s
 
 
 def validate(contract_path: Path, conf_path: Path, skill_path: Path) -> tuple[str, dict[str, str]]:
-    """Validate manifest with coherent-snapshot locking (CORE-005)."""
-    _require_coherent_root(contract_path, conf_path, skill_path)
-    paths = [contract_path, conf_path, skill_path]
-    locks = _acquire_locks(paths)
+    """Validate manifest with coherent-snapshot locking (CORE-005 / W2-002)."""
+    resolved = _resolved_manifest_map(contract_path, conf_path, skill_path)
+    locks = _acquire_locks(list(resolved.values()))
     try:
-        return _validate(contract_path, conf_path, skill_path)
+        result = _validate(resolved)
+        _assert_manifest_stable((contract_path, conf_path, skill_path), resolved)
+        return result
     finally:
         _release_locks(locks)
 
@@ -788,7 +907,7 @@ def resolve_artifact_language(
             raise SaitalkError(
                 f"artifact_language: explicit {label} language is empty"
             )
-        if not LANGUAGE_TAG.fullmatch(candidate):
+        if not _is_well_formed_language_tag(candidate):
             raise SaitalkError(
                 f"artifact_language: explicit {label} language {value!r} "
                 "is not a well-formed language tag"
@@ -801,53 +920,96 @@ def resolve_artifact_language(
     if configured == "auto":
         return "en"
     return configured# ---------------------------------------------------------------------------
-# PERF-001: Optimized drift validation
+# CORE-003 / CORE-007: Drift validation with directory-symlink traversal
+# and exact matched-line diagnostics
 # ---------------------------------------------------------------------------
 # _drift_normalize is defined at module level for precompilation.
+
+def _iter_md_files(transport_dir: Path) -> "list[Path]":
+    """Recursively list ``.md`` adapter files under *transport_dir*.
+
+    CORE-003: directory symlinks are followed (recursive descent) so an
+    adapter subtree reachable through a symlinked directory is never invisible
+    to the drift validator.  Resolved directory identities are tracked to
+    prevent cycles and duplicate traversal.
+    """
+    found: list[Path] = []
+    seen: set[Path] = set()
+
+    def _walk(directory: Path) -> None:
+        try:
+            entries = sorted(directory.iterdir())
+        except OSError:
+            return
+        for entry in entries:
+            try:
+                is_dir = entry.is_dir()
+            except OSError:
+                is_dir = False
+            if is_dir:
+                resolved = entry.resolve()
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
+                _walk(entry)
+            elif entry.is_file() and entry.name.casefold().endswith(".md"):
+                found.append(entry)
+
+    _walk(transport_dir)
+    found.sort()
+    return found
+
+
+def _drift_normalize_mapped(text: str) -> tuple[str, list[int]]:
+    """Normalize *text* for drift scanning while keeping a mapping from each
+    output character position back to its 1-based source line.
+
+    Internal whitespace (including newlines) is collapsed to a single space so
+    that a banned phrase split across a line break still matches, while the
+    line map lets us report the *actual* source line of the hit (CORE-007)
+    rather than the first occurrence of the token's first word.
+    """
+    parts: list[str] = []
+    line_for_pos: list[int] = []
+    first = True
+    for line_no, line in enumerate(text.splitlines(), 1):
+        norm = _drift_normalize(line)
+        if not norm:
+            continue
+        if not first:
+            parts.append(" ")
+            line_for_pos.append(line_no)
+        parts.append(norm)
+        line_for_pos.extend([line_no] * len(norm))
+        first = False
+    return "".join(parts), line_for_pos
+
 
 def validate_drift(root: Path) -> None:
     """Reject banned rule tokens anywhere in an adapter file's normalized text.
 
     W2-004: discovers adapters using case-insensitive ``.md`` matching so
-    ``BAD.MD`` is caught on case-sensitive filesystems.  Directory symlinks
-    are followed with recursive descent; files are identified purely by
-    their resolved name suffix (casefolded to ``.md``).
+    ``BAD.MD`` is caught on case-sensitive filesystems.  Directory symlinks are
+    followed with recursive descent (CORE-003).  The reported file:line points
+    at the start of the actually matched banned phrase (CORE-007), not at the
+    first occurrence of the token's first word.
     """
     transport_dir = root / "adapters"
     if not transport_dir.is_dir():
         return
 
-    # PERF-001: use sorted(rglob) only for deterministic failure order;
-    # the per-file matching is one compiled pass instead of 13 searches.
-    md_files: list[Path] = []
-    for p in transport_dir.rglob("*"):
-        if p.is_file() and p.name.casefold().endswith(".md"):
-            md_files.append(p)
-    md_files.sort()
-
-    for path in md_files:
+    for path in _iter_md_files(transport_dir):
         text = normalize(read_text(path))
-        # PERF-001: single precompiled alternation scan.
-        normalized_doc = _drift_normalize(text)
+        normalized_doc, line_for_pos = _drift_normalize_mapped(text)
         hit = _DRIFT_MATCH.search(normalized_doc)
         if hit:
-            # Identify which token was matched and find its line.
             matched_text = hit.group(0).lower()
-            # Find the DRIFT_BANNED entry whose normalized form matches
-            # the raw regex match (the match itself is already normalized
-            # text, so compare against normalised token forms).
             token = next(
                 (t for t in DRIFT_BANNED if _drift_normalize(t) == matched_text),
                 matched_text,
             )
-            lines = text.splitlines()
-            # The first word of the normalized token matches the first word
-            # in the normalized doc line (e.g. "completion-first" -> "completion").
-            first_word = _drift_normalize(token).split()[0]
-            line_number = next(
-                (i for i, line in enumerate(lines, 1) if first_word in _drift_normalize(line)),
-                0,
-            )
+            pos = hit.start()
+            line_number = line_for_pos[pos] if 0 <= pos < len(line_for_pos) else 0
             raise SaitalkError(
                 f"drift: {path.relative_to(root)}:{line_number} contains "
                 f"rule token {token!r}; this is a structural drift guard, "
@@ -866,11 +1028,19 @@ def _validate_package(
     skill_path: Path,
     state_path: Path | None = None,
 ) -> tuple[str, dict[str, str]]:
-    """Validate manifest + drift without acquiring locks (caller holds them)."""
-    contract_id, config = _validate(contract_path, conf_path, skill_path)
-    validate_drift(contract_path.resolve().parent)
+    """Validate manifest + drift without acquiring locks (caller holds them).
+
+    W2-001: drift runs against the *logical* supplied package root (the
+    directory holding the supplied manifest members), never the resolved
+    referent's parent, so a symlinked manifest cannot make a logical package's
+    own adapters evade validation.
+    """
+    resolved = _resolved_manifest_map(contract_path, conf_path, skill_path)
+    contract_id, config = _validate(resolved)
+    validate_drift(contract_path.parent)
     if state_path is not None:
         validate_state(state_path, contract_id)
+    _assert_manifest_stable((contract_path, conf_path, skill_path), resolved)
     return contract_id, config
 
 
@@ -881,11 +1051,10 @@ def validate_package(
     state_path: Path | None = None,
 ) -> tuple[str, dict[str, str]]:
     """Validate manifest, active-root drift, and optional bound state in one
-    coherent-locked path (CORE-005 / W2-003).
+    coherent-locked path (CORE-005 / W2-001 / W2-002).
     """
-    _require_coherent_root(contract_path, conf_path, skill_path)
-    paths = [contract_path, conf_path, skill_path]
-    locks = _acquire_locks(paths)
+    resolved = _resolved_manifest_map(contract_path, conf_path, skill_path)
+    locks = _acquire_locks(list(resolved.values()))
     try:
         return _validate_package(contract_path, conf_path, skill_path, state_path)
     finally:

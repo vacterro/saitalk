@@ -2065,11 +2065,12 @@ class EvalHarnessTests(unittest.TestCase):
                 ],
                 capture_output=True, text=True, cwd=REPO, timeout=60, check=False,
             )
-            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.returncode, 1, proc.stderr)
             self.assertNotIn("EVALS RESULTS CURRENT", proc.stdout)
             self.assertNotIn("Traceback", proc.stdout)
             self.assertNotIn("Traceback", proc.stderr)
-            self.assertIn("could not be validated", proc.stdout)
+            self.assertIn("EVALS FAIL", proc.stderr)
+            self.assertIn("could not be validated", proc.stderr)
 
     def test_validate_results_command_rejects_foreign_corpus(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -2081,6 +2082,334 @@ class EvalHarnessTests(unittest.TestCase):
             proc = run_evals_cli("validate-results", "--results", str(out))
             self.assertEqual(proc.returncode, 1)
             self.assertIn("different eval corpus", proc.stderr)
+
+
+class AuditRepairRegressionTests(unittest.TestCase):
+    """Red-control regressions for the 3-wave audit repair release (0.1.10).
+
+    Each test pins one specific defect the audit claimed fixed, so a future
+    edit cannot silently re-introduce the bug without a failing test.
+    """
+
+    from evals import harness as evals_harness
+
+    def _make_valid_package(self, root: Path) -> tuple[Path, Path, Path]:
+        contract, conf, skill = make_root(root)
+        # Refresh so the marker is consistent and validate_package can proceed
+        # past the contract_id check into the drift/structure guards.
+        saitalk.refresh(contract, conf, skill)
+        return contract, conf, skill
+
+    def _symlink_or_skip(self, src: Path, dst: Path) -> None:
+        try:
+            if dst.is_symlink() or dst.exists():
+                dst.unlink()
+            os.symlink(src, dst)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks are not supported in this environment")
+
+    # ---- CORE-002: Markdown top-level visibility scanner ------------------
+    def test_inline_comment_preserves_live_heading_before_it(self) -> None:
+        live = saitalk._top_level_lines("## 1. Live <!-- a comment -->\n")
+        self.assertIn("## 1. Live", live)
+
+    def test_inline_comment_preserves_live_heading_after_it(self) -> None:
+        live = saitalk._top_level_lines("before text <!-- c --> ## 2. Live\n")
+        self.assertIn("## 2. Live", live)
+
+    def test_four_space_indent_does_not_open_a_fence(self) -> None:
+        # A 4-space-indented ``` must NOT be treated as a fence opener, so a
+        # real heading inside it stays visible (CORE-002).
+        text = "## 1. Real\n\n    ```\n## 5. Live Heading\n    ```\n"
+        live = saitalk._top_level_lines(text)
+        self.assertIn("## 5. Live Heading", live)
+
+    def test_three_space_indent_still_opens_a_fence(self) -> None:
+        # Only 4+ space indentation is exempt; 3 spaces is a valid fence, so the
+        # inner heading is correctly hidden (negative control).
+        text = "   ```\n## 9. Hidden\n   ```\n"
+        live = saitalk._top_level_lines(text)
+        self.assertNotIn("## 9. Hidden", live)
+
+    def test_invalid_backtick_info_opener_is_live_text(self) -> None:
+        # A fence opener carrying a backtick in its info string is not a valid
+        # fence; it must not suppress a following live heading (CORE-002).
+        text = "``` `weird`\n## 9. Live Heading\n```\n"
+        live = saitalk._top_level_lines(text)
+        self.assertIn("## 9. Live Heading", live)
+
+    # ---- CORE-003: drift follows directory symlinks ----------------------
+    def test_drift_follows_directory_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "adapters").mkdir()
+            hidden = Path(temp) / "hidden"
+            hidden.mkdir()
+            (hidden / "BAD.md").write_text(
+                "# Adapter\n\nstop caveman now.\n", encoding="utf-8"
+            )
+            self._symlink_or_skip(hidden, root / "adapters" / "link")
+            with self.assertRaises(saitalk.SaitalkError):
+                saitalk.validate_drift(root)
+
+    # ---- CORE-004: stat failure is a real error --------------------------
+    def test_capture_modes_raises_on_stat_failure(self) -> None:
+        with self.assertRaises(saitalk.SaitalkError) as ctx:
+            saitalk._capture_modes([Path("/no/such/file/here")])
+        self.assertIn("cannot read permissions", str(ctx.exception))
+
+    # ---- CORE-005: staging failure is normalized -------------------------
+    def test_safe_write_temp_normalizes_mkstemp_failure(self) -> None:
+        with unittest.mock.patch(
+            "scripts.saitalk.tempfile.mkstemp",
+            side_effect=OSError("disk full"),
+        ), self.assertRaises(saitalk.SaitalkError) as ctx:
+            saitalk._safe_write_temp(Path("x"), b"data")
+        self.assertIn("staging failure", str(ctx.exception))
+
+    def test_refresh_reports_expected_failure_without_traceback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            contract, conf, skill = make_root(root)
+            # Point contract at a directory so read_bytes raises a clean error.
+            contract.unlink()
+            contract.mkdir()
+            proc = run_cli(
+                "refresh",
+                "--contract", str(contract),
+                "--config", str(conf),
+                "--skill", str(skill),
+            )
+            self.assertEqual(proc.returncode, 1, proc.stderr)
+            self.assertIn("SAITALK FAIL", proc.stdout + proc.stderr)
+            self.assertNotIn("Traceback", proc.stdout + proc.stderr)
+
+    # ---- CORE-006: full BCP 47 grammar ------------------------------------
+    def test_well_formed_language_tags_accepted(self) -> None:
+        for tag in ("en", "en-US", "en-Latn-US", "de-DE", "es-419",
+                    "zh-Hans", "zh-Hant", "zh-cmn-Hans-CN", "x-private",
+                    "x-foo-bar"):
+            with self.subTest(tag=tag):
+                self.assertTrue(saitalk._is_well_formed_language_tag(tag), tag)
+
+    def test_malformed_language_tags_rejected(self) -> None:
+        for tag in ("en--US", "a", "123", "en_US", "zh-", "x", "-en",
+                    "en_Latn_US"):
+            with self.subTest(tag=tag):
+                self.assertFalse(saitalk._is_well_formed_language_tag(tag), tag)
+
+    def test_resolve_artifact_language_honors_complex_tag(self) -> None:
+        # resolve_artifact_language must accept any well-formed explicit tag.
+        result = saitalk.resolve_artifact_language(
+            "auto", existing_language="zh-cmn-Hans-CN"
+        )
+        # BCP 47 is case-insensitive; the resolver canonicalizes to lowercase.
+        self.assertEqual(result, "zh-cmn-hans-cn")
+
+    # ---- CORE-007: drift reports the matched phrase line -----------------
+    def test_drift_reports_matched_phrase_line(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "adapters").mkdir()
+            (root / "adapters" / "BAD.md").write_text(
+                "# Adapter\n\nnormal text appears here\n\nmore prose\n\n"
+                "normal mode will suspend\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(saitalk.SaitalkError) as ctx:
+                saitalk.validate_drift(root)
+            self.assertIn("BAD.md:7", str(ctx.exception))
+
+    # ---- W2-001: drift uses the logical package root --------------------
+    def test_validate_package_drift_uses_logical_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            real = base / "real"
+            real.mkdir()
+            logical = base / "logical"
+            logical.mkdir()
+            contract, conf, skill = self._make_valid_package(real)
+            for name in ("SAITALK.md", "saitalk.conf", "SKILL.md"):
+                self._symlink_or_skip(real / name, logical / name)
+            # The drift lives ONLY in the logical directory; the real files'
+            # directory has no adapters. W2-001 must validate the logical root.
+            (logical / "adapters").mkdir()
+            (logical / "adapters" / "BAD.md").write_text(
+                "# Adapter\n\nstop caveman now.\n", encoding="utf-8"
+            )
+            with self.assertRaises(saitalk.SaitalkError):
+                saitalk.validate_package(
+                    logical / "SAITALK.md",
+                    logical / "saitalk.conf",
+                    logical / "SKILL.md",
+                )
+
+    # ---- W2-002: coherent snapshot stability guard -----------------------
+    def test_manifest_retarget_aborts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            a = base / "a"
+            b = base / "b"
+            a.mkdir()
+            b.mkdir()
+            self._make_valid_package(a)
+            self._make_valid_package(b)
+            logical = base / "logical"
+            logical.mkdir()
+            for name in ("SAITALK.md", "saitalk.conf", "SKILL.md"):
+                self._symlink_or_skip(a / name, logical / name)
+            resolved = saitalk._resolved_manifest_map(
+                logical / "SAITALK.md",
+                logical / "saitalk.conf",
+                logical / "SKILL.md",
+            )
+            # Retarget the symlinks to package b mid-flight.
+            for name in ("SAITALK.md", "saitalk.conf", "SKILL.md"):
+                self._symlink_or_skip(b / name, logical / name)
+            with self.assertRaises(saitalk.SaitalkError) as ctx:
+                saitalk._assert_manifest_stable(
+                    (logical / "SAITALK.md",
+                     logical / "saitalk.conf",
+                     logical / "SKILL.md"),
+                    resolved,
+                )
+            self.assertIn("retargeted", str(ctx.exception))
+
+    # ---- W2-003: init-results is non-destructive ------------------------
+    def test_init_results_refuses_overwrite_without_force(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp) / "results.json"
+            first = run_evals_cli("init-results", "--out", str(out))
+            self.assertEqual(first.returncode, 0, first.stderr)
+            # Record evidence into the existing file, then a no-flag re-init
+            # must refuse instead of clobbering recorded results.
+            data = self.evals_harness.load_cases(REPO / "evals" / "cases.json")
+            recorded = self.evals_harness.new_results(data)
+            recorded[data["cases"][0]["id"]] = {"state": "PASS", "reason": "x"}
+            self.evals_harness.write_results(
+                recorded, out, data, contract_id="saitalk-deadbeefdeadbeef"
+            )
+            second = run_evals_cli("init-results", "--out", str(out))
+            self.assertEqual(second.returncode, 1, second.stderr)
+            self.assertIn("refusing to overwrite", second.stderr)
+
+    def test_init_results_force_overwrites(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp) / "results.json"
+            init = run_evals_cli("init-results", "--out", str(out))
+            self.assertEqual(init.returncode, 0, init.stderr)
+            data = self.evals_harness.load_cases(REPO / "evals" / "cases.json")
+            recorded = self.evals_harness.new_results(data)
+            recorded[data["cases"][0]["id"]] = {"state": "PASS", "reason": "x"}
+            self.evals_harness.write_results(
+                recorded, out, data, contract_id="saitalk-deadbeefdeadbeef"
+            )
+            forced = run_evals_cli("init-results", "--out", str(out), "--force")
+            self.assertEqual(forced.returncode, 0, forced.stderr)
+            after = json.loads(out.read_text(encoding="utf-8"))
+            self.assertTrue(
+                all(r["state"] == "NOT_RUN" for r in after["results"].values())
+            )
+
+    def test_init_results_idempotent_when_identical(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp) / "results.json"
+            first = run_evals_cli("init-results", "--out", str(out))
+            self.assertEqual(first.returncode, 0, first.stderr)
+            second = run_evals_cli("init-results", "--out", str(out))
+            self.assertEqual(second.returncode, 0, second.stderr)
+
+    # ---- W2-004: unvalidatable active package fails loud ----------------
+    # (Covered by the modified test_validate_results_command_handles_... above)
+
+    # ---- W2-005: write_results refuses symlinks, keeps mode -------------
+    def test_write_results_refuses_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            target = base / "real.json"
+            target.write_text("{}", encoding="utf-8")
+            link = base / "link.json"
+            self._symlink_or_skip(target, link)
+            data = self.evals_harness.load_cases(REPO / "evals" / "cases.json")
+            results = self.evals_harness.new_results(data)
+            with self.assertRaises(self.evals_harness.EvalError):
+                self.evals_harness.write_results(results, link, data)
+
+    def test_write_results_preserves_posix_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp) / "results.json"
+            probe = Path(temp) / "probe"
+            probe.write_text("x", encoding="utf-8")
+            try:
+                os.chmod(probe, 0o600)
+            except OSError:
+                self.skipTest("cannot chmod in this environment")
+            if (probe.stat().st_mode & 0o777) != 0o600:
+                self.skipTest("filesystem ignores POSIX mode bits")
+            out.write_text("{}", encoding="utf-8")
+            os.chmod(out, 0o600)
+            data = self.evals_harness.load_cases(REPO / "evals" / "cases.json")
+            results = self.evals_harness.new_results(data)
+            self.evals_harness.write_results(results, out, data)
+            self.assertEqual(out.stat().st_mode & 0o777, 0o600)
+
+    # ---- PERF-001: single live-contract parse ---------------------------
+    def test_check_structure_parses_live_contract_once(self) -> None:
+        calls = {"n": 0}
+        real = saitalk._top_level_lines
+
+        def counting(text: str) -> str:
+            calls["n"] += 1
+            return real(text)
+
+        with unittest.mock.patch("scripts.saitalk._top_level_lines", counting):
+            saitalk.check_structure(
+                make_contract_text(),
+                "# SKILL\n\nSAITALK.md owns all normative behavior.\n",
+            )
+        # contract parsed once + skill parsed once; the bug re-parsed the
+        # contract several times for headings + sections 11/12.
+        self.assertEqual(calls["n"], 2)
+
+    # ---- PERF-002: single normalization of must/must_not ----------------
+    def test_validate_cases_normalizes_each_item_once(self) -> None:
+        calls = {"n": 0}
+        real_norm = self.evals_harness._norm
+
+        def counting(item: str) -> str:
+            calls["n"] += 1
+            return real_norm(item)
+
+        data = {
+            "version": 1,
+            "cases": [
+                {"id": "aa", "setup": "s", "prompt": "p",
+                 "must": ["alpha", "beta"], "must_not": ["gamma"]},
+            ],
+        }
+        with unittest.mock.patch.object(self.evals_harness, "_norm", counting):
+            self.evals_harness.validate_cases(data)
+        # exactly one normalization per item, not a second overlap pass
+        self.assertEqual(calls["n"], 3)
+
+    # ---- PERF-003: byte-identical results, no pre-sort copy -------------
+    def test_write_results_assigns_results_without_copy(self) -> None:
+        captured: dict[str, object] = {}
+        real_dump = self.evals_harness.json.dump
+
+        def capturing(obj, fh, *args, **kwargs):  # type: ignore[no-untyped-def]
+            captured["obj"] = obj
+            return real_dump(obj, fh, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp) / "results.json"
+            data = self.evals_harness.load_cases(REPO / "evals" / "cases.json")
+            results = self.evals_harness.new_results(data)
+            with unittest.mock.patch.object(
+                self.evals_harness.json, "dump", capturing
+            ):
+                self.evals_harness.write_results(results, out, data)
+        self.assertIs(captured["obj"]["results"], results)
 
 
 if __name__ == "__main__":
