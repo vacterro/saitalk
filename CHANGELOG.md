@@ -18,8 +18,7 @@ several fixes half-broken; this release re-implements and pins each one.
   cycle guard, so an adapter subtree reachable only through a symlinked
   directory can no longer evade the guard (CORE-003 / CORE-007).
 - Drift diagnostics now report the source line of the *matched* banned phrase
-  via a character-to-line map, not the first occurrence of the token's first
-  word (CORE-007).
+  via line-boundary offsets, not a per-character mapping (CORE-007 / PERF-001).
 - Refresh no longer reinterprets an `os.stat` failure as "no mode to preserve";
   a stat failure on a target it must replace now aborts cleanly (CORE-004).
 - Staging failures (mkstemp / fchmod / write / fsync / replace) are normalized

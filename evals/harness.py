@@ -9,8 +9,14 @@ import os
 import re
 import sys
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 EVAL_STATES = ("PASS", "FAIL", "SKIP", "NOT_RUN")
 REQUIRED_FIELDS = ("setup", "prompt", "must", "must_not")
@@ -27,6 +33,61 @@ class EvalError(ValueError):
     pass
 
 
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise EvalError(f"duplicate JSON key: {key!r}")
+        result[key] = value
+    return result
+
+
+def _load_json(path: Path) -> Any:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise EvalError(f"missing JSON file: {path}") from exc
+    except UnicodeDecodeError as exc:
+        raise EvalError(f"not UTF-8: {path}") from exc
+    try:
+        return json.loads(text, object_pairs_hook=_reject_duplicate_keys)
+    except EvalError as exc:
+        raise EvalError(f"invalid JSON in {path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise EvalError(f"invalid JSON in {path}: {exc}") from exc
+
+
+@contextmanager
+def _destination_lock(path: Path):
+    lock_path = Path(tempfile.gettempdir()) / (
+        "saitalk-evals-" + hashlib.sha256(str(path.absolute()).encode()).hexdigest()[:16] + ".lock"
+    )
+    fh = None
+    try:
+        if os.name == "nt" and (not lock_path.exists() or lock_path.stat().st_size < 1):
+            lock_path.write_bytes(b"\0")
+        fh = lock_path.open("r+b" if os.name == "nt" else "a+b")
+        if os.name == "nt":
+            msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+    except OSError as exc:
+        if fh is not None:
+            fh.close()
+        raise EvalError(f"cannot lock results destination {path}: {exc}") from exc
+    try:
+        yield
+    finally:
+        try:
+            if os.name == "nt":
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        finally:
+            fh.close()
+
+
 def validate_contract_id(value: Any, *, context: str) -> str:
     """The one canonical contract_id format validator: saitalk-<16 lowercase hex>."""
     if not isinstance(value, str) or not CONTRACT_ID_RE.fullmatch(value):
@@ -37,14 +98,7 @@ def validate_contract_id(value: Any, *, context: str) -> str:
 
 
 def load_cases(path: Path) -> dict[str, Any]:
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError as exc:
-        raise EvalError(f"missing eval file: {path}") from exc
-    except UnicodeDecodeError as exc:
-        raise EvalError(f"not UTF-8: {path}") from exc
-    except json.JSONDecodeError as exc:
-        raise EvalError(f"invalid JSON in {path}: {exc}") from exc
+    data = _load_json(path)
     validate_cases(data)
     return data
 
@@ -83,9 +137,10 @@ def validate_cases(data: Any) -> None:
         seen.add(cid)
         for field in REQUIRED_FIELDS:
             value = case.get(field)
-            if field in ("setup", "prompt"):
-                if not isinstance(value, str) or not value.strip():
-                    raise EvalError(f"case {cid}: {field} must be a non-empty string")
+            if field in ("setup", "prompt") and (
+                not isinstance(value, str) or not value.strip()
+            ):
+                raise EvalError(f"case {cid}: {field} must be a non-empty string")
         # PERF-002: normalize each must / must_not item exactly once into a
         # retained set; detect duplicates while building and compute the
         # overlap directly from the two sets (no throwaway second pass).
@@ -164,6 +219,57 @@ def validate_results(results: Any, cases: dict[str, Any]) -> None:
             raise EvalError(f"case {cid}: SKIP requires a recorded reason")
 
 
+def _write_results_locked(
+    results: dict[str, Any],
+    path: Path,
+    cases: dict[str, Any],
+    contract_id: str | None = None,
+) -> None:
+    payload = {
+        "version": 1,
+        "schema": "saitalk-eval-results",
+        "contract_id": contract_id,
+        "corpus": {
+            "version": cases["version"],
+            "cases": len(cases["cases"]),
+            "digest": corpus_digest(cases),
+        },
+        "results": results,
+    }
+    if path.is_symlink():
+        raise EvalError(f"write_results refuses to replace symlink destination: {path}")
+    existing_mode = None
+    if os.name != "nt" and path.is_file():
+        try:
+            existing_mode = os.stat(path).st_mode & 0o7777
+        except OSError as exc:
+            raise EvalError(f"cannot read destination mode: {path}: {exc}") from exc
+    fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".")
+    tmp = Path(tmp_path)
+    fd_owned = True
+    try:
+        fh = os.fdopen(fd, "w", encoding="utf-8")
+        fd_owned = False
+        with fh:
+            json.dump(payload, fh, ensure_ascii=True, sort_keys=True, indent=2)
+            fh.write("\n")
+            fh.flush()
+            if existing_mode is not None and os.name != "nt":
+                os.fchmod(fh.fileno(), existing_mode)
+        tmp.replace(path)
+    except BaseException:
+        if fd_owned:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
 def write_results(
     results: dict[str, Any],
     path: Path,
@@ -178,66 +284,18 @@ def write_results(
         raise EvalError(
             "recorded results (states other than NOT_RUN) must bind a contract_id"
         )
-    payload = {
-        "version": 1,
-        "schema": "saitalk-eval-results",
-        "contract_id": contract_id,
-        "corpus": {
-            "version": cases["version"],
-            "cases": len(cases["cases"]),
-            "digest": corpus_digest(cases),
-        },
-        # PERF-003: assign the results mapping directly; json.dump already
-        # sorts keys deterministically, so the redundant full-copy pre-sort
-        # added nothing but O(n log n) work and O(n) transient memory.
-        "results": results,
-    }
-    # W2-005: preserve destination metadata and refuse to sever symlinks.
-    if path.is_symlink():
-        raise EvalError(f"write_results refuses to replace symlink destination: {path}")
-    existing_mode = None
-    if os.name != "nt" and path.is_file():
-        try:
-            existing_mode = os.stat(path).st_mode & 0o7777
-        except OSError:
-            existing_mode = None
-    # CORE-001: use a unique temporary file created with mkstemp so no
-    # pre-existing hardlink/symlink at <path>.tmp can be followed.
-    fd, tmp_path = tempfile.mkstemp(
-        dir=str(path.parent), prefix=path.name + "."
-    )
-    tmp = Path(tmp_path)
-    try:
-        if existing_mode is not None:
-            try:
-                os.fchmod(fd, existing_mode)
-            except OSError:
-                pass
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, ensure_ascii=True, sort_keys=True, indent=2)
-            fh.write("\n")
-        tmp.replace(path)
-    except BaseException:
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
+    with _destination_lock(path):
+        _write_results_locked(results, path, cases, contract_id)
 
 
 def load_results(path: Path, cases: dict[str, Any]) -> dict[str, Any]:
-    """Load and fully validate a results file: schema, corpus binding, and
-    contract_id provenance (format, and presence whenever any state is
-    recorded) -- the same invariant write_results enforces on the way out.
-    """
+    """Load and fully validate a results file and its provenance."""
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError as exc:
-        raise EvalError(f"missing results file: {path}") from exc
-    except UnicodeDecodeError as exc:
-        raise EvalError(f"not UTF-8: {path}") from exc
-    except json.JSONDecodeError as exc:
-        raise EvalError(f"invalid JSON in {path}: {exc}") from exc
+        data = _load_json(path)
+    except EvalError as exc:
+        if str(exc).startswith("missing JSON file:"):
+            raise EvalError(str(exc).replace("missing JSON file:", "missing results file:", 1)) from exc
+        raise
     if not isinstance(data, dict):
         raise EvalError(f"{path}: results document must be a JSON object")
     unknown_root = set(data) - RESULTS_ROOT_KEYS
@@ -352,33 +410,32 @@ def main() -> int:
             data = load_cases(cases_path)
             results = new_results(data)
             out = args.out or cases_path.with_name("results.json")
-            if out.exists() and not getattr(args, "force", False):
-                # W2-003: non-destructive by default.  Refuse to clobber
-                # recorded evidence; an identical all-NOT_RUN init is a no-op.
-                try:
-                    existing = load_results(out, data)
-                except (EvalError, OSError, json.JSONDecodeError):
-                    existing = None
-                if (
-                    existing is not None
-                    and existing.get("version") == 1
-                    and existing.get("schema") == "saitalk-eval-results"
-                ):
-                    recorded = any(
-                        r["state"] != "NOT_RUN" for r in existing["results"].values()
-                    )
+            with _destination_lock(out):
+                if out.exists() and not getattr(args, "force", False):
+                    try:
+                        existing = load_results(out, data)
+                    except (EvalError, OSError, json.JSONDecodeError):
+                        existing = None
                     if (
-                        not recorded
-                        and existing["results"] == results
-                        and existing.get("corpus", {}).get("digest") == corpus_digest(data)
+                        existing is not None
+                        and existing.get("version") == 1
+                        and existing.get("schema") == "saitalk-eval-results"
                     ):
-                        print(f"EVALS RESULTS: {out} (already initialized, no-op)")
-                        return 0
-                raise EvalError(
-                    f"init-results: refusing to overwrite existing results file "
-                    f"{out}; use --force to reset recorded evidence"
-                )
-            write_results(results, out, data)
+                        recorded = any(
+                            r["state"] != "NOT_RUN" for r in existing["results"].values()
+                        )
+                        if (
+                            not recorded
+                            and existing["results"] == results
+                            and existing.get("corpus", {}).get("digest") == corpus_digest(data)
+                        ):
+                            print(f"EVALS RESULTS: {out} (already initialized, no-op)")
+                            return 0
+                    raise EvalError(
+                        f"init-results: refusing to overwrite existing results file "
+                        f"{out}; use --force to reset recorded evidence"
+                    )
+                _write_results_locked(results, out, data)
             print(f"EVALS RESULTS: {out} ({len(results)} cases NOT_RUN)")
             return 0
         if args.command == "validate-results":
@@ -386,12 +443,6 @@ def main() -> int:
             results_path = args.results or cases_path.with_name("results.json")
             loaded = load_results(results_path, data)
             bound_id = loaded.get("contract_id")
-            if bound_id is None:
-                print(
-                    f"EVALS RESULTS VALID (no contract_id bound; only NOT_RUN entries): "
-                    f"{results_path}"
-                )
-                return 0
             try:
                 active_id = current_contract_id(args)
             except Exception as exc:  # noqa: BLE001 - reported, never VALID
@@ -400,6 +451,12 @@ def main() -> int:
                     file=sys.stderr,
                 )
                 return 1
+            if bound_id is None:
+                print(
+                    f"EVALS RESULTS VALID (no contract_id bound; only NOT_RUN entries): "
+                    f"{results_path}"
+                )
+                return 0
             if bound_id == active_id:
                 print(
                     f"EVALS RESULTS CURRENT: {results_path} bound to the active "

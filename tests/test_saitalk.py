@@ -1469,6 +1469,7 @@ class CanonicalSuiteTests(unittest.TestCase):
         self.assertRegex(version, r"^\d+\.\d+\.\d+$")
         readme = (REPO / "README.md").read_text(encoding="utf-8")
         self.assertIn(f"Current release: {version}.", readme)
+        self.assertIn(f"tagging this exact commit `v{version}`", readme)
         changelog = (REPO / "CHANGELOG.md").read_text(encoding="utf-8")
         headings = re.findall(r"^## (\d+\.\d+\.\d+) - ", changelog, re.MULTILINE)
         self.assertTrue(headings, "no release headings in CHANGELOG")
@@ -2220,7 +2221,24 @@ class AuditRepairRegressionTests(unittest.TestCase):
                 saitalk.validate_drift(root)
             self.assertIn("BAD.md:7", str(ctx.exception))
 
-    # ---- W2-001: drift uses the logical package root --------------------
+    # ---- W2-001: drift uses the logical package root ----
+    # ---- CORE-003: closing fence with trailing text -----------------------
+    def test_closing_fence_trailing_text_does_not_close(self) -> None:
+        # A closing fence with trailing text must NOT close the fence,
+        # so content after it stays hidden inside the block.
+        text = "```python\n## 9. Hidden\n``` extra text\n## 10. Still Hidden\n```\n"
+        live = saitalk._top_level_lines(text)
+        self.assertNotIn("## 9. Hidden", live)
+        self.assertNotIn("## 10. Still Hidden", live)
+
+    def test_closing_fence_whitespace_only_closes(self) -> None:
+        # A closing fence with only trailing whitespace IS valid.
+        text = "```\n## 9. Hidden\n```   \n## 10. Visible\n"
+        live = saitalk._top_level_lines(text)
+        self.assertNotIn("## 9. Hidden", live)
+        self.assertIn("## 10. Visible", live)
+
+    # ---- W2-001: drift uses the logical package root ----
     def test_validate_package_drift_uses_logical_root(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             base = Path(temp)
@@ -2228,7 +2246,7 @@ class AuditRepairRegressionTests(unittest.TestCase):
             real.mkdir()
             logical = base / "logical"
             logical.mkdir()
-            contract, conf, skill = self._make_valid_package(real)
+            self._make_valid_package(real)
             for name in ("SAITALK.md", "saitalk.conf", "SKILL.md"):
                 self._symlink_or_skip(real / name, logical / name)
             # The drift lives ONLY in the logical directory; the real files'
@@ -2391,6 +2409,70 @@ class AuditRepairRegressionTests(unittest.TestCase):
             self.evals_harness.validate_cases(data)
         # exactly one normalization per item, not a second overlap pass
         self.assertEqual(calls["n"], 3)
+
+    def test_mixed_logical_roots_rejected_even_when_physical_root_matches(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            real = base / "real"
+            left = base / "left"
+            right = base / "right"
+            real.mkdir()
+            left.mkdir()
+            right.mkdir()
+            self._make_valid_package(real)
+            self._symlink_or_skip(real / "SAITALK.md", left / "SAITALK.md")
+            self._symlink_or_skip(real / "saitalk.conf", right / "saitalk.conf")
+            self._symlink_or_skip(real / "SKILL.md", right / "SKILL.md")
+            with self.assertRaises(saitalk.SaitalkError) as ctx:
+                saitalk.validate_package(
+                    left / "SAITALK.md",
+                    right / "saitalk.conf",
+                    right / "SKILL.md",
+                )
+            self.assertIn("coherent package root", str(ctx.exception))
+
+    def test_extra_live_state_field_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            state = Path(temp) / "STATE.md"
+            state.write_text(
+                "saitalk_contract: saitalk-12345678abcdef12\n"
+                "saitalk_status: active\n"
+                "saitalk_voice: active\n"
+                "saitalk_shadow: stale\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(saitalk.SaitalkError) as ctx:
+                saitalk.validate_state(state, "saitalk-12345678abcdef12")
+            self.assertIn("saitalk_shadow", str(ctx.exception))
+
+    def test_iter_md_files_handles_deep_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "adapters"
+            root.mkdir()
+            current = root
+            for index in range(1100):
+                current = current / f"d{index % 10}"
+                current.mkdir()
+            leaf = current / "leaf.md"
+            leaf.write_text("safe\n", encoding="utf-8")
+            self.assertEqual(saitalk._iter_md_files(root), [leaf])
+            leaf.unlink()
+            for _ in range(1100):
+                current.rmdir()
+                current = current.parent
+            root.rmdir()
+
+    def test_strict_json_loader_rejects_duplicate_nested_key(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "cases.json"
+            path.write_text(
+                '{"version":1,"cases":[{"id":"case-1","setup":"s",'
+                '"prompt":"p","must":["x"],"must":["y"],"must_not":["z"]}]}',
+                encoding="utf-8",
+            )
+            with self.assertRaises(self.evals_harness.EvalError) as ctx:
+                self.evals_harness.load_cases(path)
+            self.assertIn("duplicate JSON key", str(ctx.exception))
 
     # ---- PERF-003: byte-identical results, no pre-sort copy -------------
     def test_write_results_assigns_results_without_copy(self) -> None:

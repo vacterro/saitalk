@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import bisect
 import hashlib
 import itertools
 import os
 import re
+import stat
 import sys
 import tempfile
 from pathlib import Path
@@ -51,47 +53,71 @@ SECTION_COUNT = len(CANONICAL_SECTIONS)
 # script, region, variants, extensions and private-use subtags, plus the
 # private-use-only form.  This matches the contract's promise that any
 # well-formed explicit language tag is honored.
+_GRANDFATHERED_LANGUAGE_TAGS = frozenset({
+    "art-lojban", "cel-gaulish", "en-gb-oed", "i-ami", "i-bnn",
+    "i-default", "i-enochian", "i-hak", "i-klingon", "i-lux", "i-mingo",
+    "i-navajo", "i-pwn", "i-tao", "i-tay", "i-tsu", "no-bok", "no-nyn",
+    "sgn-be-fr", "sgn-be-nl", "sgn-ch-de", "zh-guoyu", "zh-hakka",
+    "zh-min", "zh-min-nan", "zh-xiang",
+})
+
+
 def _is_well_formed_language_tag(tag: str) -> bool:
-    # BCP 47 tags are case-insensitive; normalize so subtag comparisons are
-    # always lowercase (e.g. en-US, zh-cmn-Hans-CN, zh-CN).
-    parts = tag.casefold().split("-")
-    if not parts or any(not p for p in parts):
+    normalized = tag.casefold()
+    if normalized in _GRANDFATHERED_LANGUAGE_TAGS:
+        return True
+    parts = normalized.split("-")
+    if not parts or any(not part for part in parts):
         return False
-    primary = parts[0]
-    if not re.fullmatch(r"[a-z]{2,3}", primary):
-        # private-use-only form: x + one or more privateuse subtags
-        if primary == "x":
-            return len(parts) >= 2 and all(
-                re.fullmatch(r"[a-z0-9]{1,8}", p) for p in parts[1:]
-            )
+    if parts[0] == "x":
+        return len(parts) > 1 and all(re.fullmatch(r"[a-z0-9]{1,8}", part) for part in parts[1:])
+    if re.fullmatch(r"[a-z]{4,8}", parts[0]):
+        index = 1
+    elif re.fullmatch(r"[a-z]{2,3}", parts[0]):
+        index = 1
+        extlangs = 0
+        while index < len(parts) and re.fullmatch(r"[a-z]{3}", parts[index]) and extlangs < 3:
+            index += 1
+            extlangs += 1
+    else:
         return False
-    idx = 1
-    if idx < len(parts) and re.fullmatch(r"[a-z]{3}", parts[idx]):  # extlang
-        idx += 1
-    if idx < len(parts) and re.fullmatch(r"[a-z]{4}", parts[idx]):  # script
-        idx += 1
-    if idx < len(parts) and (
-        re.fullmatch(r"[a-z]{2}", parts[idx]) or re.fullmatch(r"[0-9]{3}", parts[idx])
-    ):  # region
-        idx += 1
-    while idx < len(parts) and (
-        re.fullmatch(r"[a-z0-9]{5,8}", parts[idx])
-        or re.fullmatch(r"[0-9][a-z0-9]{3}", parts[idx])
-    ):  # variants
-        idx += 1
-    while idx < len(parts) and re.fullmatch(r"[a-wyz]", parts[idx]):  # extension singleton
-        idx += 1
-        if idx >= len(parts):
+
+    if index < len(parts) and re.fullmatch(r"[a-z]{4}", parts[index]):
+        index += 1
+    if index < len(parts) and (
+        re.fullmatch(r"[a-z]{2}", parts[index])
+        or re.fullmatch(r"[0-9]{3}", parts[index])
+    ):
+        index += 1
+    variants: set[str] = set()
+    while index < len(parts) and (
+        re.fullmatch(r"[a-z0-9]{5,8}", parts[index])
+        or re.fullmatch(r"[0-9][a-z0-9]{3}", parts[index])
+    ):
+        if parts[index] in variants:
             return False
-        while idx < len(parts) and re.fullmatch(r"[a-z0-9]{2,8}", parts[idx]):
-            idx += 1
-    if idx < len(parts) and parts[idx] == "x":  # privateuse
-        idx += 1
-        if idx >= len(parts):
+        variants.add(parts[index])
+        index += 1
+    singletons: set[str] = set()
+    while index < len(parts) and re.fullmatch(r"[a-wyz0-9]", parts[index]):
+        singleton = parts[index]
+        if singleton in singletons:
             return False
-        while idx < len(parts) and re.fullmatch(r"[a-z0-9]{1,8}", parts[idx]):
-            idx += 1
-    return idx == len(parts)
+        singletons.add(singleton)
+        index += 1
+        start = index
+        while index < len(parts) and re.fullmatch(r"[a-z0-9]{2,8}", parts[index]):
+            index += 1
+        if index == start:
+            return False
+    if index < len(parts) and parts[index] == "x":
+        index += 1
+        start = index
+        while index < len(parts) and re.fullmatch(r"[a-z0-9]{1,8}", parts[index]):
+            index += 1
+        if index == start:
+            return False
+    return index == len(parts)
 
 VOICE_STOP = {"stop caveman", "normal mode"}
 VOICE_RESUME = {"resume caveman", "saitalk mode"}
@@ -250,67 +276,48 @@ def _top_level_lines(text: str) -> str:
     in_comment = False
 
     for line in text.splitlines():
-        remaining = line
-
-        # Inside a multi-line HTML comment: drop until the closing marker.
+        cursor = 0
+        live_parts: list[str] = []
         if in_comment:
-            close_idx = remaining.find("-->")
+            close_idx = line.find("-->")
             if close_idx == -1:
                 continue
             in_comment = False
-            remaining = remaining[close_idx + 3:]
-            # fall through to continue scanning the rest of the line
-
-        # Inside a fenced block: only look for a valid closing fence.
+            cursor = close_idx + 3
         if fence_char is not None:
-            stripped = remaining.strip()
-            m = FENCE_PATTERN.match(stripped)
-            if m and m.group(1)[0] == fence_char and len(m.group(1)) >= fence_len:
+            candidate = line[cursor:]
+            match = re.fullmatch(r" {0,3}(`{3,}|~{3,})[ \t]*", candidate)
+            if match and match.group(1)[0] == fence_char and len(match.group(1)) >= fence_len:
                 fence_char = None
                 fence_len = 0
             continue
-
-        # Scan for inline HTML comments; keep live text before and after.
-        while True:
-            comment_start = remaining.find("<!--")
+        while cursor < len(line):
+            comment_start = line.find("<!--", cursor)
             if comment_start == -1:
+                live_parts.append(line[cursor:])
                 break
-            before = remaining[:comment_start]
-            after_open = remaining[comment_start + 4:]
-            close_idx = after_open.find("-->")
+            live_parts.append(line[cursor:comment_start])
+            close_idx = line.find("-->", comment_start + 4)
             if close_idx == -1:
-                # Comment runs to subsequent lines.
-                if before.strip():
-                    kept.append(before)
                 in_comment = True
-                remaining = ""
+                cursor = len(line)
                 break
-            # Comment closes on the same line: preserve before + after.
-            remaining = before + after_open[close_idx + 3:]
-
+            cursor = close_idx + 3
+        remaining = "".join(live_parts)
         if not remaining:
             continue
-
-        # Fence opener detection: Markdown requires 0-3 leading spaces.
         leading = len(remaining) - len(remaining.lstrip(" "))
         if leading <= 3:
             stripped = remaining.strip()
-            m = FENCE_PATTERN.match(stripped)
-            if m:
-                opener = m.group(1)
-                if opener[0] == "`":
-                    # A backtick fence info string may not contain a backtick.
-                    if "`" in stripped[len(opener):]:
-                        pass  # invalid opener -> treat the line as live text
-                    else:
-                        fence_char = "`"
-                        fence_len = len(opener)
-                        continue
+            match = FENCE_PATTERN.match(stripped)
+            if match:
+                opener = match.group(1)
+                if opener[0] == "`" and "`" in stripped[len(opener):]:
+                    pass
                 else:
-                    fence_char = "~"
+                    fence_char = opener[0]
                     fence_len = len(opener)
                     continue
-
         kept.append(remaining)
 
     return "\n".join(kept)
@@ -369,13 +376,18 @@ def parse_conf(text: str) -> dict[str, str]:
     return values
 
 
-def _require_coherent_root(contract_path: Path, conf_path: Path, skill_path: Path) -> None:
+def _require_coherent_root(
+    contract_path: Path, conf_path: Path, skill_path: Path
+) -> Path:
     paths = (contract_path, conf_path, skill_path)
-    try:
-        resolved = [path.resolve() for path in paths]
-    except OSError as exc:
-        raise SaitalkError(f"cannot resolve manifest path: {exc}") from exc
-    for a, b in itertools.combinations(resolved, 2):
+    logical_parents = {Path(os.path.abspath(path.parent)) for path in paths}
+    if len(logical_parents) != 1:
+        raise SaitalkError("manifest members do not form one coherent package root")
+    return next(iter(logical_parents))
+
+
+def _validate_resolved_manifest(resolved: dict[str, Path]) -> None:
+    for a, b in itertools.combinations(resolved.values(), 2):
         try:
             if a == b or os.path.samefile(a, b):
                 raise SaitalkError("manifest members alias the same file")
@@ -383,11 +395,8 @@ def _require_coherent_root(contract_path: Path, conf_path: Path, skill_path: Pat
             pass
         except OSError as exc:
             raise SaitalkError(f"cannot compare manifest paths: {exc}") from exc
-    parents = {path.parent for path in resolved}
-    if len(parents) > 1:
-        raise SaitalkError(
-            "manifest members do not form one coherent package root"
-        )
+    if len({path.parent for path in resolved.values()}) > 1:
+        raise SaitalkError("manifest members do not form one coherent package root")
 
 
 def _manifest_members(
@@ -404,11 +413,8 @@ def _manifest_members(
 
 
 def read_manifest(contract_path: Path, conf_path: Path, skill_path: Path) -> dict[str, str]:
-    _require_coherent_root(contract_path, conf_path, skill_path)
-    manifest: dict[str, str] = {}
-    for label, path in _manifest_members(contract_path, conf_path, skill_path):
-        manifest[label] = read_text(path)
-    return manifest
+    resolved = _resolved_manifest_map(contract_path, conf_path, skill_path)
+    return _read_resolved_manifest(resolved)
 
 
 def replace_contract_value(text: str, label: str) -> str:
@@ -575,8 +581,8 @@ def _release_locks(handles) -> None:
 
 def _safe_write_temp(target: Path, data: bytes, mode: int | None = None) -> Path:
     """Create a unique temporary file in the same directory as *target*,
-    write *data*, flush, fsync, and return the path.  If *mode* is given
-    the file descriptor is set to that mode before writing (POSIX).
+    write *data*, flush, fsync, and return the path.  If *mode* is given,
+    final file permissions are applied after content writing (POSIX).
 
     CORE-005: any filesystem failure (``mkstemp``, ``fchmod``, write, flush,
     ``fsync``) is normalized into a ``SaitalkError`` carrying the target and
@@ -590,18 +596,22 @@ def _safe_write_temp(target: Path, data: bytes, mode: int | None = None) -> Path
         fd, tmp_path = tempfile.mkstemp(dir=str(dir_path), prefix=prefix)
     except OSError as exc:
         raise SaitalkError(f"staging failure for {target}: {exc}") from exc
+    fd_owned = True
     try:
-        if mode is not None and os.name != "nt":
-            os.fchmod(fd, mode)
-        with os.fdopen(fd, "wb") as fh:
+        fh = os.fdopen(fd, "wb")
+        fd_owned = False
+        with fh:
             fh.write(data)
             fh.flush()
+            if mode is not None and os.name != "nt":
+                os.fchmod(fh.fileno(), mode)
             os.fsync(fh.fileno())
-    except OSError as exc:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
+    except BaseException as exc:
+        if fd_owned:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         try:
             os.unlink(tmp_path)
         except OSError:
@@ -618,19 +628,26 @@ def _replace_temp(target: Path, tmp: Path) -> None:
 
 
 def _restore_bytes(target: Path, original: bytes, mode: int | None = None) -> None:
+    tmp: Path | None = None
+    failure: SaitalkError | None = None
     try:
         tmp = _safe_write_temp(target, original, mode=mode)
         os.replace(tmp, target)
     except OSError as exc:
-        raise SaitalkError(f"restore failure on {target}: {exc}") from exc
-    finally:
-        # Clean up any stale .restore.tmp from the old implementation.
-        # Also clean the unique tmp if replace succeeded (now at target).
+        failure = SaitalkError(f"restore failure on {target}: {exc}")
+    except SaitalkError as exc:
+        failure = SaitalkError(f"restore failure on {target}: {exc}")
+    if tmp is not None:
         try:
-            # unique tmp was moved by os.replace; unlink is harmless if gone
-            pass
-        except OSError:
-            pass
+            tmp.unlink(missing_ok=True)
+        except OSError as exc:
+            cleanup = f"restore cleanup failure on {target}: {exc}"
+            if failure is None:
+                failure = SaitalkError(cleanup)
+            else:
+                failure = SaitalkError(f"{failure}; {cleanup}")
+    if failure is not None:
+        raise failure
 
 
 def _capture_modes(paths: list[Path]) -> dict[Path, int]:
@@ -672,19 +689,13 @@ def refresh(contract_path: Path, conf_path: Path, skill_path: Path) -> str:
     replaced with regular files.
 
     W2-002: POSIX permission bits of each target are captured before staging
-    and applied to every staged file (and every rollback file).
+    and applied to every staged file (     and every rollback file), after content writes complete.
+
 
     PERF-003: targets whose replacement bytes are identical to the original
     bytes are skipped entirely -- no staging, no fsync, no inode churn.
     """
-    _require_coherent_root(contract_path, conf_path, skill_path)
-
-    # W2-001: establish one canonical resolved-referent mapping and use it
-    # for every mutable operation.  Logical RUNTIME_MANIFEST labels stay
-    # based on the supplied canonical filenames.
-    resolved_map: dict[str, Path] = {}
-    for label, path in _manifest_members(contract_path, conf_path, skill_path):
-        resolved_map[label] = path.resolve()
+    resolved_map = _resolved_manifest_map(contract_path, conf_path, skill_path)
 
     resolved_targets = [resolved_map["SAITALK.md"], resolved_map["saitalk.conf"], resolved_map["SKILL.md"]]
     locks = _acquire_locks(resolved_targets)
@@ -767,13 +778,18 @@ def refresh(contract_path: Path, conf_path: Path, skill_path: Path) -> str:
 def _resolved_manifest_map(
     contract_path: Path, conf_path: Path, skill_path: Path
 ) -> dict[str, Path]:
-    """Resolve each manifest member exactly once and return label -> resolved
-    path.  This is the single stable identity used for the whole operation.
-    """
+    """Resolve manifest members once, then validate captured physical identity."""
     _require_coherent_root(contract_path, conf_path, skill_path)
-    resolved: dict[str, Path] = {}
-    for label, path in _manifest_members(contract_path, conf_path, skill_path):
-        resolved[label] = path.resolve()
+    paths = (contract_path, conf_path, skill_path)
+    try:
+        resolved = {
+            label: path.resolve()
+            for label, path in zip(RUNTIME_MANIFEST, paths)
+        }
+    except OSError as exc:
+        raise SaitalkError(f"cannot resolve manifest path: {exc}") from exc
+    _validate_resolved_manifest(resolved)
+    _manifest_members(contract_path, conf_path, skill_path)
     return resolved
 
 
@@ -856,6 +872,13 @@ def voice_command(message: str) -> str | None:
 def validate_state(path: Path, expected: str) -> None:
     text = normalize(read_text(path))
     top = _top_level_lines(text)
+    live_fields = set(re.findall(r"(?m)^\s*(saitalk_[a-z0-9_]+):", top))
+    allowed_fields = {"saitalk_contract", "saitalk_status", "saitalk_voice"}
+    extra_fields = live_fields - allowed_fields
+    if extra_fields:
+        raise SaitalkError(
+            "unknown live SAITALK state fields: " + ", ".join(sorted(extra_fields))
+        )
     contract_match = exactly_one(STATE_PATTERN, top, "saitalk_contract")
     status_match = exactly_one(STATE_STATUS_PATTERN, top, "saitalk_status")
     voice_match = exactly_one(STATE_VOICE_PATTERN, top, "saitalk_voice")
@@ -919,70 +942,69 @@ def resolve_artifact_language(
             return resolved[label]
     if configured == "auto":
         return "en"
-    return configured# ---------------------------------------------------------------------------
+    return configured
+
+
+# ---------------------------------------------------------------------------
 # CORE-003 / CORE-007: Drift validation with directory-symlink traversal
 # and exact matched-line diagnostics
 # ---------------------------------------------------------------------------
 # _drift_normalize is defined at module level for precompilation.
 
-def _iter_md_files(transport_dir: Path) -> "list[Path]":
-    """Recursively list ``.md`` adapter files under *transport_dir*.
-
-    CORE-003: directory symlinks are followed (recursive descent) so an
-    adapter subtree reachable through a symlinked directory is never invisible
-    to the drift validator.  Resolved directory identities are tracked to
-    prevent cycles and duplicate traversal.
-    """
+def _iter_md_files(transport_dir: Path) -> list[Path]:
+    """List Markdown adapters iteratively, following directories safely."""
     found: list[Path] = []
     seen: set[Path] = set()
-
-    def _walk(directory: Path) -> None:
+    try:
+        seen.add(transport_dir.resolve())
+    except OSError as exc:
+        raise SaitalkError(f"cannot resolve adapter path {transport_dir}: {exc}") from exc
+    stack = [transport_dir]
+    while stack:
+        directory = stack.pop()
         try:
-            entries = sorted(directory.iterdir())
-        except OSError:
-            return
+            entries = sorted(directory.iterdir(), key=lambda entry: str(entry))
+        except OSError as exc:
+            raise SaitalkError(f"cannot inspect adapter directory {directory}: {exc}") from exc
+        directories: list[Path] = []
         for entry in entries:
             try:
-                is_dir = entry.is_dir()
-            except OSError:
-                is_dir = False
-            if is_dir:
-                resolved = entry.resolve()
-                if resolved in seen:
-                    continue
-                seen.add(resolved)
-                _walk(entry)
-            elif entry.is_file() and entry.name.casefold().endswith(".md"):
+                entry_mode = entry.stat().st_mode
+            except OSError as exc:
+                raise SaitalkError(f"cannot classify adapter path {entry}: {exc}") from exc
+            if stat.S_ISDIR(entry_mode):
+                try:
+                    resolved = entry.resolve()
+                except OSError as exc:
+                    raise SaitalkError(f"cannot resolve adapter path {entry}: {exc}") from exc
+                if resolved not in seen:
+                    seen.add(resolved)
+                    directories.append(entry)
+            elif stat.S_ISREG(entry_mode) and entry.name.casefold().endswith(".md"):
                 found.append(entry)
-
-    _walk(transport_dir)
+        stack.extend(reversed(directories))
     found.sort()
     return found
 
 
-def _drift_normalize_mapped(text: str) -> tuple[str, list[int]]:
-    """Normalize *text* for drift scanning while keeping a mapping from each
-    output character position back to its 1-based source line.
-
-    Internal whitespace (including newlines) is collapsed to a single space so
-    that a banned phrase split across a line break still matches, while the
-    line map lets us report the *actual* source line of the hit (CORE-007)
-    rather than the first occurrence of the token's first word.
-    """
+def _drift_normalize_mapped(text: str) -> tuple[str, list[tuple[int, int]]]:
+    """Normalize text and record output offsets at source-line boundaries."""
     parts: list[str] = []
-    line_for_pos: list[int] = []
+    line_starts: list[tuple[int, int]] = []
     first = True
+    output_length = 0
     for line_no, line in enumerate(text.splitlines(), 1):
         norm = _drift_normalize(line)
         if not norm:
             continue
         if not first:
             parts.append(" ")
-            line_for_pos.append(line_no)
+            output_length += 1
+        line_starts.append((output_length, line_no))
         parts.append(norm)
-        line_for_pos.extend([line_no] * len(norm))
+        output_length += len(norm)
         first = False
-    return "".join(parts), line_for_pos
+    return "".join(parts), line_starts
 
 
 def validate_drift(root: Path) -> None:
@@ -995,8 +1017,14 @@ def validate_drift(root: Path) -> None:
     first occurrence of the token's first word.
     """
     transport_dir = root / "adapters"
-    if not transport_dir.is_dir():
+    try:
+        transport_mode = transport_dir.stat().st_mode
+    except FileNotFoundError:
         return
+    except OSError as exc:
+        raise SaitalkError(f"cannot inspect adapter path {transport_dir}: {exc}") from exc
+    if not stat.S_ISDIR(transport_mode):
+        raise SaitalkError(f"adapter path is not a directory: {transport_dir}")
 
     for path in _iter_md_files(transport_dir):
         text = normalize(read_text(path))
@@ -1009,7 +1037,10 @@ def validate_drift(root: Path) -> None:
                 matched_text,
             )
             pos = hit.start()
-            line_number = line_for_pos[pos] if 0 <= pos < len(line_for_pos) else 0
+            line_number = (
+                line_for_pos[bisect.bisect_right(line_for_pos, (pos, sys.maxsize)) - 1][1]
+                if line_for_pos else 0
+            )
             raise SaitalkError(
                 f"drift: {path.relative_to(root)}:{line_number} contains "
                 f"rule token {token!r}; this is a structural drift guard, "
@@ -1027,17 +1058,16 @@ def _validate_package(
     conf_path: Path,
     skill_path: Path,
     state_path: Path | None = None,
+    resolved: dict[str, Path] | None = None,
+    logical_root: Path | None = None,
 ) -> tuple[str, dict[str, str]]:
-    """Validate manifest + drift without acquiring locks (caller holds them).
-
-    W2-001: drift runs against the *logical* supplied package root (the
-    directory holding the supplied manifest members), never the resolved
-    referent's parent, so a symlinked manifest cannot make a logical package's
-    own adapters evade validation.
-    """
-    resolved = _resolved_manifest_map(contract_path, conf_path, skill_path)
+    """Validate one already-captured manifest snapshot without acquiring locks."""
+    if resolved is None:
+        resolved = _resolved_manifest_map(contract_path, conf_path, skill_path)
+    if logical_root is None:
+        logical_root = _require_coherent_root(contract_path, conf_path, skill_path)
     contract_id, config = _validate(resolved)
-    validate_drift(contract_path.parent)
+    validate_drift(logical_root)
     if state_path is not None:
         validate_state(state_path, contract_id)
     _assert_manifest_stable((contract_path, conf_path, skill_path), resolved)
@@ -1054,9 +1084,13 @@ def validate_package(
     coherent-locked path (CORE-005 / W2-001 / W2-002).
     """
     resolved = _resolved_manifest_map(contract_path, conf_path, skill_path)
+    logical_root = _require_coherent_root(contract_path, conf_path, skill_path)
     locks = _acquire_locks(list(resolved.values()))
     try:
-        return _validate_package(contract_path, conf_path, skill_path, state_path)
+        return _validate_package(
+            contract_path, conf_path, skill_path, state_path,
+            resolved=resolved, logical_root=logical_root,
+        )
     finally:
         _release_locks(locks)
 
