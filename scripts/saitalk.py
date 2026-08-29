@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import bisect
 import hashlib
 import itertools
 import os
@@ -303,10 +302,25 @@ def _top_level_lines(text: str) -> str:
                 cursor = len(line)
                 break
             cursor = close_idx + 3
-        remaining = "".join(live_parts)
-        if not remaining:
+        # W2-002: join with a space so that surrounding source fragments
+        # separated by an HTML comment cannot concatenate into false syntax
+        # (e.g. ~~ + ~~ must not become ~~~~).
+        remaining = " ".join(live_parts)
+        if not remaining.strip():
             continue
-        leading = len(remaining) - len(remaining.lstrip(" "))
+        # CORE-001: count leading *columns*, not literal bytes.  Markdown
+        # treats a tab as advancing to the next multiple of 4 columns, so
+        # expand tabs before measuring leading whitespace.  Only spaces and
+        # tabs are significant; other Unicode whitespace does not contribute
+        # to fence-leading indentation.
+        leading = 0
+        for ch in remaining:
+            if ch == " ":
+                leading += 1
+            elif ch == "\t":
+                leading = (leading // 4 + 1) * 4
+            else:
+                break
         if leading <= 3:
             stripped = remaining.strip()
             match = FENCE_PATTERN.match(stripped)
@@ -733,8 +747,12 @@ def refresh(contract_path: Path, conf_path: Path, skill_path: Path) -> str:
         if new_conf != conf_bytes:
             pairs.append((resolved_map["saitalk.conf"], new_conf, conf_bytes))
 
+        # W2-001: assert manifest stability *before* any writes so a
+        # retargeted symlink that was swapped between resolve and lock
+        # acquisition is caught before we mutate any file.
+        _assert_manifest_stable((contract_path, conf_path, skill_path), resolved_map)
+
         if not pairs:
-            _assert_manifest_stable((contract_path, conf_path, skill_path), resolved_map)
             return new_id
 
         temps: dict[Path, Path] = {}
@@ -952,13 +970,20 @@ def resolve_artifact_language(
 # _drift_normalize is defined at module level for precompilation.
 
 def _iter_md_files(transport_dir: Path) -> list[Path]:
-    """List Markdown adapters iteratively, following directories safely."""
+    """List Markdown adapters iteratively, following directories safely.
+
+    PERF-001: cycle detection uses (st_dev, st_ino) from stat() instead of
+    Path.resolve(), avoiding O(n*d) resolve work in deep trees.  Directory
+    classification uses ``entry.is_dir()`` (follows symlinks) so symlinked
+    directories are traversed correctly.
+    """
     found: list[Path] = []
-    seen: set[Path] = set()
+    seen: set[tuple[int, int]] = set()
     try:
-        seen.add(transport_dir.resolve())
+        root_stat = os.stat(transport_dir, follow_symlinks=True)
+        seen.add((root_stat.st_dev, root_stat.st_ino))
     except OSError as exc:
-        raise SaitalkError(f"cannot resolve adapter path {transport_dir}: {exc}") from exc
+        raise SaitalkError(f"cannot stat adapter path {transport_dir}: {exc}") from exc
     stack = [transport_dir]
     while stack:
         directory = stack.pop()
@@ -969,42 +994,42 @@ def _iter_md_files(transport_dir: Path) -> list[Path]:
         directories: list[Path] = []
         for entry in entries:
             try:
-                entry_mode = entry.stat().st_mode
+                if entry.is_dir():
+                    # For cycle detection, stat the resolved target.
+                    target_stat = os.stat(entry, follow_symlinks=True)
+                    entry_id = (target_stat.st_dev, target_stat.st_ino)
+                    if entry_id not in seen:
+                        seen.add(entry_id)
+                        directories.append(entry)
+                elif entry.is_file() and entry.name.casefold().endswith(".md"):
+                    found.append(entry)
             except OSError as exc:
                 raise SaitalkError(f"cannot classify adapter path {entry}: {exc}") from exc
-            if stat.S_ISDIR(entry_mode):
-                try:
-                    resolved = entry.resolve()
-                except OSError as exc:
-                    raise SaitalkError(f"cannot resolve adapter path {entry}: {exc}") from exc
-                if resolved not in seen:
-                    seen.add(resolved)
-                    directories.append(entry)
-            elif stat.S_ISREG(entry_mode) and entry.name.casefold().endswith(".md"):
-                found.append(entry)
         stack.extend(reversed(directories))
     found.sort()
     return found
 
 
-def _drift_normalize_mapped(text: str) -> tuple[str, list[tuple[int, int]]]:
-    """Normalize text and record output offsets at source-line boundaries."""
-    parts: list[str] = []
-    line_starts: list[tuple[int, int]] = []
-    first = True
-    output_length = 0
-    for line_no, line in enumerate(text.splitlines(), 1):
-        norm = _drift_normalize(line)
-        if not norm:
-            continue
-        if not first:
-            parts.append(" ")
-            output_length += 1
-        line_starts.append((output_length, line_no))
-        parts.append(norm)
-        output_length += len(norm)
-        first = False
-    return "".join(parts), line_starts
+def _raise_drift(path: Path, root: Path, line_no: int, normalized_text: str) -> None:
+    """Raise a drift error for a matched banned token in *normalized_text*.
+
+    The reported line is *line_no* (1-based source line).  The token is
+    identified by matching the normalized form against DRIFT_BANNED.
+    """
+    hit = _DRIFT_MATCH.search(normalized_text)
+    if hit is None:
+        return
+    matched_text = hit.group(0).lower()
+    token = next(
+        (t for t in DRIFT_BANNED if _drift_normalize(t) == matched_text),
+        matched_text,
+    )
+    raise SaitalkError(
+        f"drift: {path.relative_to(root)}:{line_no} contains "
+        f"rule token {token!r}; this is a structural drift guard, "
+        "not proof of semantic conformance. Transport files must "
+        "not restate or extend the contract"
+    )
 
 
 def validate_drift(root: Path) -> None:
@@ -1015,6 +1040,10 @@ def validate_drift(root: Path) -> None:
     followed with recursive descent (CORE-003).  The reported file:line points
     at the start of the actually matched banned phrase (CORE-007), not at the
     first occurrence of the token's first word.
+
+    PERF-003: scans line-by-line so memory usage is O(max_line_length) rather
+    than O(file_size).  Cross-line tokens are caught by normalizing two
+    consecutive lines joined with a space.
     """
     transport_dir = root / "adapters"
     try:
@@ -1028,25 +1057,22 @@ def validate_drift(root: Path) -> None:
 
     for path in _iter_md_files(transport_dir):
         text = normalize(read_text(path))
-        normalized_doc, line_for_pos = _drift_normalize_mapped(text)
-        hit = _DRIFT_MATCH.search(normalized_doc)
-        if hit:
-            matched_text = hit.group(0).lower()
-            token = next(
-                (t for t in DRIFT_BANNED if _drift_normalize(t) == matched_text),
-                matched_text,
-            )
-            pos = hit.start()
-            line_number = (
-                line_for_pos[bisect.bisect_right(line_for_pos, (pos, sys.maxsize)) - 1][1]
-                if line_for_pos else 0
-            )
-            raise SaitalkError(
-                f"drift: {path.relative_to(root)}:{line_number} contains "
-                f"rule token {token!r}; this is a structural drift guard, "
-                "not proof of semantic conformance. Transport files must "
-                "not restate or extend the contract"
-            )
+        lines = text.splitlines()
+        prev_norm = ""
+        prev_line_no = 0
+        for line_no, line in enumerate(lines, 1):
+            norm = _drift_normalize(line)
+            # Check the single normalized line.
+            if norm and _DRIFT_MATCH.search(norm):
+                _raise_drift(path, root, line_no, norm)
+            # Check a two-line window to catch tokens split across lines
+            # (e.g. "stop\ncaveman" → normalized to "stop caveman").
+            if prev_norm and norm and _DRIFT_MATCH.search(prev_norm + " " + norm):
+                # Report the line where the match starts (the first word).
+                _raise_drift(path, root, prev_line_no, prev_norm + " " + norm)
+            if norm:
+                prev_norm = norm
+                prev_line_no = line_no
 
 
 # ---------------------------------------------------------------------------

@@ -59,18 +59,26 @@ def _load_json(path: Path) -> Any:
 
 @contextmanager
 def _destination_lock(path: Path):
+    """CORE-002 / PERF-002 / W2-003: canonicalized lock identity,
+    non-blocking acquisition, and safe teardown.
+    """
+    # CORE-002: resolve() gives the canonical filesystem identity so two
+    # symlinks pointing at the same file share one lock.
+    canonical = path.resolve(strict=False)
     lock_path = Path(tempfile.gettempdir()) / (
-        "saitalk-evals-" + hashlib.sha256(str(path.absolute()).encode()).hexdigest()[:16] + ".lock"
+        "saitalk-evals-" + hashlib.sha256(str(canonical).encode()).hexdigest()[:16] + ".lock"
     )
     fh = None
     try:
         if os.name == "nt" and (not lock_path.exists() or lock_path.stat().st_size < 1):
             lock_path.write_bytes(b"\0")
         fh = lock_path.open("r+b" if os.name == "nt" else "a+b")
+        # PERF-002: non-blocking acquisition so contention is surfaced as
+        # an EvalError instead of an indefinite stall.
         if os.name == "nt":
-            msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
         else:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError as exc:
         if fh is not None:
             fh.close()
@@ -78,14 +86,20 @@ def _destination_lock(path: Path):
     try:
         yield
     finally:
+        # W2-003: suppress cleanup errors so they never mask a primary
+        # exception from the guarded block.
         try:
             if os.name == "nt":
                 fh.seek(0)
                 msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
             else:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-        finally:
+        except OSError:
+            pass
+        try:
             fh.close()
+        except OSError:
+            pass
 
 
 def validate_contract_id(value: Any, *, context: str) -> str:

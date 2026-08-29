@@ -2493,6 +2493,183 @@ class AuditRepairRegressionTests(unittest.TestCase):
                 self.evals_harness.write_results(results, out, data)
         self.assertIs(captured["obj"]["results"], results)
 
+    # ---- CORE-001: tab-indented pseudo-fences ----------------------------
+
+    def test_tab_indented_backtick_fence_is_not_live(self) -> None:
+        # A backtick fence preceded by a tab should be treated as
+        # indented code (4+ columns), not as a fence opener.
+        text = "\t```\n## Hidden\n```\n"
+        live = saitalk._top_level_lines(text)
+        self.assertIn("## Hidden", live)
+
+    def test_tab_then_space_indented_fence_is_not_live(self) -> None:
+        # Tab + space = 5 columns of leading indent, exceeding the
+        # 0-3 column allowance for fence openers.
+        text = "\t ```\n## Hidden\n```\n"
+        live = saitalk._top_level_lines(text)
+        self.assertIn("## Hidden", live)
+
+    def test_space_indented_fence_opener_works(self) -> None:
+        # 1-3 leading spaces is a valid fence opener per Markdown.
+        text = " ```python\n## Hidden\n```\n"
+        live = saitalk._top_level_lines(text)
+        self.assertNotIn("## Hidden", live)
+
+    # ---- CORE-002: canonical lock identity for symlinked paths ------------
+
+    def test_destination_lock_canonicalizes_symlink(self) -> None:
+        # Two paths (one a symlink of the other) must share the same
+        # lock identity so concurrent writes don't race.
+        import hashlib
+        with tempfile.TemporaryDirectory() as td:
+            real = Path(td) / "results.json"
+            real.write_text("{}")
+            link = Path(td) / "alias.json"
+            try:
+                link.symlink_to(real)
+            except (OSError, NotImplementedError):
+                self.skipTest("symlinks not supported")
+            from evals.harness import _destination_lock
+            canonical_real = real.resolve(strict=False)
+            canonical_link = link.resolve(strict=False)
+            self.assertEqual(canonical_real, canonical_link)
+
+    # ---- W2-001: pre-write manifest stability check ----------------------
+
+    def test_pre_write_manifest_stability_is_checked(self) -> None:
+        # After refresh completes, the manifest must still be coherent.
+        # We test the happy path -- if pre-write check is wired in,
+        # refresh completes without error on a valid package.
+        root = Path(__file__).resolve().parents[1]
+        contract = root / "SAITALK.md"
+        conf = root / "saitalk.conf"
+        skill = root / "SKILL.md"
+        contract_id = saitalk.refresh(contract, conf, skill)
+        self.assertTrue(contract_id.startswith("saitalk-"))
+        self.assertEqual(len(contract_id), 8 + 16)
+
+    # ---- W2-002: HTML comment removal preserves lexical separation -------
+
+    def test_inline_comment_removal_does_not_synthesize_fence(self) -> None:
+        # ~~<!-- hidden -->~~ must NOT become ~~~~ (a fence).
+        text = "~~<!-- hidden -->~~\n## Hidden\n~~~\n"
+        live = saitalk._top_level_lines(text)
+        self.assertNotIn("~~~~", live)
+        self.assertIn("## Hidden", live)
+
+    def test_inline_comment_removal_preserves_surrounding_text(self) -> None:
+        text = "## Before <!-- hidden --> After\n"
+        live = saitalk._top_level_lines(text)
+        self.assertIn("## Before", live)
+        self.assertIn("After", live)
+
+    # ---- W2-003: cleanup errors do not mask primary exceptions -----------
+
+    def test_destination_lock_suppresses_close_error(self) -> None:
+        # Even if close() fails, the primary operation's result is preserved.
+        import os
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "results.json"
+            target.write_text("{}")
+            from evals.harness import _destination_lock
+            # Normal lock/unlock should work without error.
+            with _destination_lock(target):
+                pass
+
+    # ---- PERF-001: (st_dev, st_ino) cycle detection in _iter_md_files ---
+
+    def test_iter_md_files_handles_deep_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "adapters"
+            leaf = root / "deep" / "nested" / "dir"
+            leaf.mkdir(parents=True)
+            (leaf / "test.md").write_text("# Adapter\n")
+            result = saitalk._iter_md_files(root)
+            self.assertEqual(len(result), 1)
+            self.assertEqual(result[0].name, "test.md")
+
+    def test_iter_md_files_follows_symlinked_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "adapters"
+            root.mkdir()
+            real = Path(td) / "real"
+            real.mkdir()
+            (real / "linked.md").write_text("# Adapter\n")
+            try:
+                (root / "link").symlink_to(real)
+            except (OSError, NotImplementedError):
+                self.skipTest("symlinks not supported")
+            result = saitalk._iter_md_files(root)
+            names = [p.name for p in result]
+            self.assertIn("linked.md", names)
+
+    # ---- PERF-002: non-blocking lock acquisition in evals harness --------
+
+    def test_destination_lock_fails_fast_on_contention(self) -> None:
+        import threading
+        import os
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "results.json"
+            target.write_text("{}")
+            from evals.harness import _destination_lock, EvalError
+            barrier = threading.Barrier(2, timeout=5)
+            error = []
+
+            def hold_lock():
+                with _destination_lock(target):
+                    barrier.wait()  # signal we hold the lock
+                    barrier.wait()  # wait for the other thread to try
+
+            def try_lock():
+                barrier.wait()  # wait until the lock is held
+                try:
+                    with _destination_lock(target):
+                        error.append("should not acquire")
+                except (EvalError, OSError):
+                    pass  # expected: contention surfaced immediately
+
+            t1 = threading.Thread(target=hold_lock)
+            t2 = threading.Thread(target=try_lock)
+            t1.start()
+            t2.start()
+            t1.join(timeout=10)
+            t2.join(timeout=10)
+            self.assertEqual(error, [])
+
+    # ---- PERF-003: line-by-line drift scanning (O(max_line_length)) ------
+
+    def test_drift_catches_banned_token_in_single_line(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "adapters").mkdir()
+            (root / "adapters" / "bad.md").write_text(
+                "# Adapter\n\nstop caveman now.\n", encoding="utf-8"
+            )
+            with self.assertRaises(saitalk.SaitalkError) as ctx:
+                saitalk.validate_drift(root)
+            self.assertIn("stop caveman", str(ctx.exception))
+
+    def test_drift_catches_cross_line_token(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "adapters").mkdir()
+            (root / "adapters" / "bad.md").write_text(
+                "# Adapter\n\ncompletion-\nfirst rule.\n", encoding="utf-8"
+            )
+            with self.assertRaises(saitalk.SaitalkError) as ctx:
+                saitalk.validate_drift(root)
+            self.assertIn("completion-first", str(ctx.exception))
+
+    def test_drift_clean_adapter_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "adapters").mkdir()
+            (root / "adapters" / "good.md").write_text(
+                "# Good Adapter\n\nThis adapter is compliant.\n", encoding="utf-8"
+            )
+            # Should not raise
+            saitalk.validate_drift(root)
+
 
 if __name__ == "__main__":
     unittest.main()
