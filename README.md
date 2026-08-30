@@ -144,9 +144,9 @@ unrun cases stay `NOT_RUN`. See [evals/README.md](evals/README.md).
 
 ## Version
 
-Current release: 0.1.10. This is the version this working tree declares:
+Current release: 0.1.11. This is the version this working tree declares:
 VERSION, README, and CHANGELOG agree (enforced by the test suite). Shipping
-it also means tagging this exact commit `v0.1.10`; the test suite verifies a
+it also means tagging this exact commit `v0.1.11`; the test suite verifies a
 matching tag when one exists but does not require one, so a declared version
 is not by itself a claim that this tree is tagged. See
 [CHANGELOG.md](CHANGELOG.md).

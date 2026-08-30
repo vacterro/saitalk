@@ -250,89 +250,241 @@ def normalize(text: str) -> str:
 # CORE-002: Fixed Markdown top-level-line filter
 # ---------------------------------------------------------------------------
 
+_INLINE_CODE_RUN = re.compile(r"`+")
+_HTML_COMMENT_OPEN = "<!--"
+_HTML_COMMENT_CLOSE = "-->"
+
+
+def _scan_code_spans(line: str) -> list[tuple[int, int]]:
+    """Return [start, end) byte offsets of every inline code span in *line*.
+
+    A code span is a run of N>=1 backticks; it ends at the next run of N
+    backticks.  An unmatched run is not a code span (CommonMark rule: an
+    inline code span cannot contain a backtick run of equal or greater
+    length than the opener).  We use a length-based scan that handles
+    the simple CommonMark case (no escaping, no nested backticks inside
+    the run) -- sufficient for the comment/fence boundary check the
+    validator needs.
+    """
+    spans: list[tuple[int, int]] = []
+    cursor = 0
+    while cursor < len(line):
+        if line[cursor] != "`":
+            cursor += 1
+            continue
+        run_start = cursor
+        while cursor < len(line) and line[cursor] == "`":
+            cursor += 1
+        run_len = cursor - run_start
+        # find a closing run of the same length
+        close_start = cursor
+        while close_start < len(line):
+            if line[close_start] != "`":
+                close_start += 1
+                continue
+            end = close_start
+            while end < len(line) and line[end] == "`":
+                end += 1
+            if end - close_start == run_len:
+                spans.append((run_start, end))
+                cursor = end
+                break
+            close_start = end
+        else:
+            # No matching close -- this is plain text, keep scanning past.
+            continue
+    return spans
+
+
+def _in_code_span(offset: int, spans: list[tuple[int, int]]) -> bool:
+    for start, end in spans:
+        if start <= offset < end:
+            return True
+        if offset < start:
+            return False
+    return False
+
+
+def _strip_html_comments_preserving_spans(
+    line: str, in_comment: bool
+) -> tuple[str, bool]:
+    """Remove ``<!--`` ... ``-->`` runs from *line*; HTML-comment delimiters
+    that fall inside a backtick code span are kept literally.
+
+    Returns ``(out, still_in_comment)`` where *out* contains the same
+    characters the caller would have obtained from a naive elision, but
+    code-span content is preserved verbatim, so a backtick-opener carrying
+    a backtick inside its info string is still recognised as text.
+    """
+    out: list[str] = []
+    cursor = 0
+    spans = _scan_code_spans(line) if not in_comment else []
+    span_idx = 0
+    while cursor < len(line):
+        if in_comment:
+            close = line.find(_HTML_COMMENT_CLOSE, cursor)
+            if close == -1:
+                cursor = len(line)
+                break
+            cursor = close + len(_HTML_COMMENT_CLOSE)
+            in_comment = False
+            spans = _scan_code_spans(line[cursor:])
+            span_idx = 0
+            continue
+        # advance span_idx to the first span whose end > cursor
+        while span_idx < len(spans) and spans[span_idx][1] <= cursor:
+            span_idx += 1
+        in_span = (
+            span_idx < len(spans)
+            and spans[span_idx][0] <= cursor < spans[span_idx][1]
+        )
+        if in_span:
+            out.append(line[cursor])
+            cursor += 1
+            continue
+        # find the next comment-open or code-span boundary from cursor
+        next_open = line.find(_HTML_COMMENT_OPEN, cursor)
+        if next_open == -1:
+            out.append(line[cursor:])
+            cursor = len(line)
+            break
+        # if the opener falls inside a code span, treat it as literal text
+        opener_in_span = False
+        for start, end in spans:
+            if start <= next_open < end:
+                opener_in_span = True
+                # rewrite spans relative to out
+                break
+        if opener_in_span:
+            out.append(line[cursor:next_open + len(_HTML_COMMENT_OPEN)])
+            cursor = next_open + len(_HTML_COMMENT_OPEN)
+            continue
+        out.append(line[cursor:next_open])
+        cursor = next_open + len(_HTML_COMMENT_OPEN)
+        close = line.find(_HTML_COMMENT_CLOSE, cursor)
+        if close == -1:
+            in_comment = True
+            cursor = len(line)
+            break
+        cursor = close + len(_HTML_COMMENT_CLOSE)
+        spans = _scan_code_spans(line[cursor:])
+        span_idx = 0
+    return "".join(out), in_comment
+
+
+def _leading_columns(line: str) -> int:
+    """Return the column width of leading spaces/tabs in *line*.
+
+    Tabs expand to the next multiple of four columns; a tab therefore
+    advances the cursor by ``(leading // 4 + 1) * 4 - leading`` columns.
+    """
+    leading = 0
+    cursor = 0
+    while cursor < len(line) and line[cursor] in (" ", "\t"):
+        if line[cursor] == " ":
+            leading += 1
+        else:
+            leading = (leading // 4 + 1) * 4
+        cursor += 1
+    return leading, cursor
+
+
+def _fence_opener_span(line: str, closing: bool = False) -> tuple[int, int, str] | None:
+    """Return ``(indent_cols, run_len, delim)`` for a valid fence opener at
+    the start of *line*, or ``None`` if *line* is not a fence opener.
+
+    A fence opener is 0-3 leading columns of spaces/tabs followed by a
+    run of 3+ identical `` or ~ characters.  A backtick opener is invalid
+    if its info string contains a backtick (CommonMark: a backtick run
+    that opens a code span cannot simultaneously close a fence).  A
+    *closing* fence (the second argument) must carry no info string
+    except whitespace; ``\`\`\` extra text`` does not close a fence
+    (CommonMark).
+    """
+    leading, cursor = _leading_columns(line)
+    if leading > 3 or cursor >= len(line):
+        return None
+    delim = line[cursor]
+    if delim not in ("`", "~"):
+        return None
+    run_start = cursor
+    while cursor < len(line) and line[cursor] == delim:
+        cursor += 1
+    run_len = cursor - run_start
+    if run_len < 3:
+        return None
+    info = line[cursor:].rstrip()
+    if delim == "`" and "`" in info:
+        return None
+    if closing and info.strip():
+        return None
+    return leading, run_len, delim
+
+
 def _top_level_lines(text: str) -> str:
     """Return only the *live* top-level lines of *text*.
 
     A line is live when it is outside fenced code blocks (``` or ~~~) and
     outside HTML comments.  The following Markdown boundaries are honoured
-    (CORE-002):
+    (CORE-001 / CORE-002 / W2-001):
 
-    * **Fenced blocks** – a fence opener must begin with 0-3 leading spaces
-      and use 3+ identical backticks or tildes; a backtick opener may not
-      carry a backtick inside its info string (that is not a valid fence).
-      A closing fence must use the same delimiter character and at least as
-      many delimiter characters as the opener.  Four-space indented code is
-      an indented-code construct, never a fence, so it cannot mask live
-      headings.
-    * **HTML comments** – both ``<!--`` ... ``-->`` spanning multiple lines
-      and same-line comments are recognised.  Any live text *before* an
-      inline comment and *after* its closing ``-->`` is preserved, so an
-      inline comment can never hide a live heading that precedes it.
+    * **Inline code spans** – backtick code spans on a non-fenced line are
+      recognised and their content is preserved verbatim.  An HTML-comment
+      delimiter (``<!--`` or ``-->``) inside a code span is literal text,
+      not a comment opener/closer.  Conversely, a fence opener whose info
+      string contains a backtick is invalid: the backtick opens a code
+      span and the run is non-fence text.
+    * **Fenced blocks** – fence validity (opener/closer, info string,
+      trailing text) is evaluated against the *original* line bytes before
+      any HTML-comment elision.  An invalid backtick opener (carrying a
+      backtick) or a closing fence carrying non-whitespace info is
+      rejected on the original source span, so removing comment bytes can
+      never synthesise a fence that did not exist.  Four-space (or wider)
+      indented code is an indented-code construct, never a fence, so it
+      cannot mask live headings.
+    * **HTML comments** – both ``<!--`` ... ``-->`` spanning multiple
+      lines and same-line comments are recognised.  Any live text
+      *before* an inline comment and *after* its closing ``-->`` is
+      preserved, so an inline comment can never hide a live heading that
+      precedes it.  Comment content inside a backtick code span is
+      preserved verbatim.
     """
     kept: list[str] = []
     fence_char: str | None = None
     fence_len: int = 0
     in_comment = False
 
-    for line in text.splitlines():
-        cursor = 0
-        live_parts: list[str] = []
+    for raw_line in text.splitlines():
         if in_comment:
-            close_idx = line.find("-->")
+            close_idx = raw_line.find(_HTML_COMMENT_CLOSE)
             if close_idx == -1:
                 continue
             in_comment = False
-            cursor = close_idx + 3
+            head = raw_line[close_idx + len(_HTML_COMMENT_CLOSE):]
+        else:
+            head = raw_line
         if fence_char is not None:
-            candidate = line[cursor:]
-            match = re.fullmatch(r" {0,3}(`{3,}|~{3,})[ \t]*", candidate)
-            if match and match.group(1)[0] == fence_char and len(match.group(1)) >= fence_len:
+            opener = _fence_opener_span(head, closing=True)
+            if opener is not None and opener[2] == fence_char and opener[1] >= fence_len:
                 fence_char = None
                 fence_len = 0
             continue
-        while cursor < len(line):
-            comment_start = line.find("<!--", cursor)
-            if comment_start == -1:
-                live_parts.append(line[cursor:])
-                break
-            live_parts.append(line[cursor:comment_start])
-            close_idx = line.find("-->", comment_start + 4)
-            if close_idx == -1:
-                in_comment = True
-                cursor = len(line)
-                break
-            cursor = close_idx + 3
-        # W2-002: join with a space so that surrounding source fragments
-        # separated by an HTML comment cannot concatenate into false syntax
-        # (e.g. ~~ + ~~ must not become ~~~~).
-        remaining = " ".join(live_parts)
-        if not remaining.strip():
+        # CORE-001: fence validity is decided on the ORIGINAL head bytes;
+        # HTML-comment elision must never create or destroy a fence.
+        opener = _fence_opener_span(head)
+        stripped, in_comment = _strip_html_comments_preserving_spans(head, in_comment)
+        if not stripped.strip():
             continue
-        # CORE-001: count leading *columns*, not literal bytes.  Markdown
-        # treats a tab as advancing to the next multiple of 4 columns, so
-        # expand tabs before measuring leading whitespace.  Only spaces and
-        # tabs are significant; other Unicode whitespace does not contribute
-        # to fence-leading indentation.
-        leading = 0
-        for ch in remaining:
-            if ch == " ":
-                leading += 1
-            elif ch == "\t":
-                leading = (leading // 4 + 1) * 4
-            else:
-                break
-        if leading <= 3:
-            stripped = remaining.strip()
-            match = FENCE_PATTERN.match(stripped)
-            if match:
-                opener = match.group(1)
-                if opener[0] == "`" and "`" in stripped[len(opener):]:
-                    pass
-                else:
-                    fence_char = opener[0]
-                    fence_len = len(opener)
-                    continue
-        kept.append(remaining)
+        if stripped != head and _fence_opener_span(stripped) is not None:
+            # Removing comment bytes synthesised a fence out of two halves;
+            # neither the original nor the synthesised run is a fence, and
+            # the line carries no live content the validator can trust.
+            continue
+        if opener is not None:
+            fence_char = opener[2]
+            fence_len = opener[1]
+            continue
+        kept.append(stripped)
 
     return "\n".join(kept)
 
@@ -544,7 +696,11 @@ def _acquire_lock(target: Path):
         else:
             fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError as exc:
-        fh.close()
+        # W2-005: a follow-up close failure must not mask the lock error.
+        try:
+            fh.close()
+        except BaseException:
+            pass
         raise SaitalkError(
             f"lock contention on {target}: another refresh is in progress"
         ) from exc
@@ -552,6 +708,11 @@ def _acquire_lock(target: Path):
 
 
 def _release_lock(fh) -> None:
+    # W2-005: a cleanup error must never replace an already-active primary
+    # exception. Swallow OSError from unlock and from close so a primary
+    # SaitalkError/OpsError raised earlier stays visible. Both branches use
+    # bare ``except OSError`` so a non-OSError cancellation during cleanup
+    # still propagates.
     try:
         if os.name == "nt":
             fh.seek(0)
@@ -560,7 +721,10 @@ def _release_lock(fh) -> None:
             fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
     except OSError:
         pass
-    fh.close()
+    try:
+        fh.close()
+    except OSError:
+        pass
 
 
 def _acquire_locks(targets: list[Path]) -> list:
@@ -583,8 +747,18 @@ def _acquire_locks(targets: list[Path]) -> list:
 
 
 def _release_locks(handles) -> None:
+    # W2-005: every acquired handle receives a release attempt even if an
+    # earlier cleanup raised. The first exception observed is re-raised so
+    # a primary caller still sees *some* cleanup signal if it asked for one.
+    first_exc: BaseException | None = None
     for fh in reversed(handles):
-        _release_lock(fh)
+        try:
+            _release_lock(fh)
+        except BaseException as exc:
+            if first_exc is None:
+                first_exc = exc
+    if first_exc is not None:
+        raise first_exc
 
 
 # ---------------------------------------------------------------------------
@@ -763,8 +937,11 @@ def refresh(contract_path: Path, conf_path: Path, skill_path: Path) -> str:
             for target, tmp in temps.items():
                 _replace_temp(target, tmp)
                 replaced.append(target)
-        except SaitalkError as primary:
-            rollback_failures = []
+        except BaseException as primary:
+            # W2-002: any unsuccessful exit (including cancellation,
+            # OSError, programming errors) restores exactly the targets
+            # this invocation already replaced.
+            rollback_failures: list[str] = []
             for target, _content, original in pairs:
                 if target not in replaced:
                     continue
@@ -772,10 +949,13 @@ def refresh(contract_path: Path, conf_path: Path, skill_path: Path) -> str:
                     _restore_bytes(target, original, mode=modes_map.get(target))
                 except SaitalkError as exc:
                     rollback_failures.append(f"{target}: {exc}")
+                except BaseException as exc:
+                    rollback_failures.append(f"{target}: {type(exc).__name__}: {exc}")
             if rollback_failures:
-                raise SaitalkError(
+                chained = SaitalkError(
                     f"{primary}; rollback incomplete: " + "; ".join(rollback_failures)
-                ) from primary
+                )
+                raise chained from primary
             raise
         finally:
             for tmp in temps.values():
@@ -888,8 +1068,21 @@ def voice_command(message: str) -> str | None:
 
 
 def validate_state(path: Path, expected: str) -> None:
-    text = normalize(read_text(path))
-    top = _top_level_lines(text)
+    validate_state_bytes(path.read_bytes(), expected)
+
+
+def validate_state_bytes(blob: bytes, expected: str) -> None:
+    """Validate a state file from a captured byte snapshot (W2-003).
+
+    Equivalent to ``validate_state`` but reads from *blob* so the caller
+    can prove a later on-disk change cannot affect the verdict.
+    """
+    try:
+        text = blob.decode("utf-8").removeprefix("\ufeff")
+    except UnicodeDecodeError as exc:
+        raise SaitalkError(f"state not UTF-8: {exc}") from exc
+    normalized = normalize(text)
+    top = _top_level_lines(normalized)
     live_fields = set(re.findall(r"(?m)^\s*(saitalk_[a-z0-9_]+):", top))
     allowed_fields = {"saitalk_contract", "saitalk_status", "saitalk_voice"}
     extra_fields = live_fields - allowed_fields
@@ -969,45 +1162,50 @@ def resolve_artifact_language(
 # ---------------------------------------------------------------------------
 # _drift_normalize is defined at module level for precompilation.
 
-def _iter_md_files(transport_dir: Path) -> list[Path]:
-    """List Markdown adapters iteratively, following directories safely.
+def _iter_md_files(transport_dir: Path):
+    """Yield Markdown adapters iteratively, following directories safely.
 
-    PERF-001: cycle detection uses (st_dev, st_ino) from stat() instead of
-    Path.resolve(), avoiding O(n*d) resolve work in deep trees.  Directory
-    classification uses ``entry.is_dir()`` (follows symlinks) so symlinked
-    directories are traversed correctly.
+    PERF-001: a generator instead of a fully populated list.  Cycle
+    detection uses (st_dev, st_ino) from stat() instead of Path.resolve(),
+    avoiding O(n*d) resolve work in deep trees.  Directory classification
+    uses ``entry.is_dir()`` (follows symlinks) so symlinked directories
+    are traversed correctly.  Adapters are yielded in deterministic
+    lexical order so a lexically-first invalid file is seen first.
     """
-    found: list[Path] = []
     seen: set[tuple[int, int]] = set()
     try:
         root_stat = os.stat(transport_dir, follow_symlinks=True)
         seen.add((root_stat.st_dev, root_stat.st_ino))
     except OSError as exc:
         raise SaitalkError(f"cannot stat adapter path {transport_dir}: {exc}") from exc
-    stack = [transport_dir]
-    while stack:
-        directory = stack.pop()
+    pending: list[Path] = [transport_dir]
+    # Deterministic order across the whole tree: collect each directory's
+    # matches and subdirectories, then yield matches sorted by path before
+    # descending.  This lets ``validate_drift`` fail fast on the lexically
+    # first invalid adapter without enumerating the remainder.
+    while pending:
+        directory = pending.pop()
         try:
             entries = sorted(directory.iterdir(), key=lambda entry: str(entry))
         except OSError as exc:
             raise SaitalkError(f"cannot inspect adapter directory {directory}: {exc}") from exc
+        files: list[Path] = []
         directories: list[Path] = []
         for entry in entries:
             try:
                 if entry.is_dir():
-                    # For cycle detection, stat the resolved target.
                     target_stat = os.stat(entry, follow_symlinks=True)
                     entry_id = (target_stat.st_dev, target_stat.st_ino)
                     if entry_id not in seen:
                         seen.add(entry_id)
                         directories.append(entry)
                 elif entry.is_file() and entry.name.casefold().endswith(".md"):
-                    found.append(entry)
+                    files.append(entry)
             except OSError as exc:
                 raise SaitalkError(f"cannot classify adapter path {entry}: {exc}") from exc
-        stack.extend(reversed(directories))
-    found.sort()
-    return found
+        for path in sorted(files, key=lambda p: str(p)):
+            yield path
+        pending.extend(reversed(directories))
 
 
 def _raise_drift(path: Path, root: Path, line_no: int, normalized_text: str) -> None:
@@ -1041,9 +1239,10 @@ def validate_drift(root: Path) -> None:
     at the start of the actually matched banned phrase (CORE-007), not at the
     first occurrence of the token's first word.
 
-    PERF-003: scans line-by-line so memory usage is O(max_line_length) rather
-    than O(file_size).  Cross-line tokens are caught by normalizing two
-    consecutive lines joined with a space.
+    PERF-001: each adapter is opened directly, read one line at a time with
+    universal newline handling, and normalized in place.  No whole-file
+    ``read_text`` + ``splitlines`` materialization.  Cross-line tokens are
+    caught by retaining only the previous normalized line.
     """
     transport_dir = root / "adapters"
     try:
@@ -1056,28 +1255,66 @@ def validate_drift(root: Path) -> None:
         raise SaitalkError(f"adapter path is not a directory: {transport_dir}")
 
     for path in _iter_md_files(transport_dir):
-        text = normalize(read_text(path))
-        lines = text.splitlines()
         prev_norm = ""
         prev_line_no = 0
-        for line_no, line in enumerate(lines, 1):
-            norm = _drift_normalize(line)
-            # Check the single normalized line.
-            if norm and _DRIFT_MATCH.search(norm):
-                _raise_drift(path, root, line_no, norm)
-            # Check a two-line window to catch tokens split across lines
-            # (e.g. "stop\ncaveman" → normalized to "stop caveman").
-            if prev_norm and norm and _DRIFT_MATCH.search(prev_norm + " " + norm):
-                # Report the line where the match starts (the first word).
-                _raise_drift(path, root, prev_line_no, prev_norm + " " + norm)
-            if norm:
-                prev_norm = norm
-                prev_line_no = line_no
+        try:
+            with path.open("r", encoding="utf-8", errors="strict", newline="") as fh:
+                # Universal-newline translation: split on the actual line
+                # terminators present in the file (\n, \r, \r\n) without
+                # materializing the whole file.
+                for line_no, raw in enumerate(fh, 1):
+                    line = raw.rstrip("\r\n")
+                    norm = _drift_normalize(line)
+                    if norm and _DRIFT_MATCH.search(norm):
+                        _raise_drift(path, root, line_no, norm)
+                    if (
+                        prev_norm
+                        and norm
+                        and _DRIFT_MATCH.search(prev_norm + " " + norm)
+                    ):
+                        _raise_drift(path, root, prev_line_no, prev_norm + " " + norm)
+                    if norm:
+                        prev_norm = norm
+                        prev_line_no = line_no
+        except UnicodeDecodeError as exc:
+            raise SaitalkError(
+                f"drift: {path.relative_to(root)}: not UTF-8: {exc}"
+            ) from exc
+        except OSError as exc:
+            raise SaitalkError(
+                f"drift: {path.relative_to(root)}: cannot read: {exc}"
+            ) from exc
 
 
 # ---------------------------------------------------------------------------
 # W2-003 / CORE-004: validate_package
 # ---------------------------------------------------------------------------
+
+def _capture_state_snapshot(state_path: Path) -> tuple[Path, bytes, tuple[int, int, int], float]:
+    """Capture the logical path, file identity and bytes for *state_path*.
+
+    Returns ``(path, bytes, stat_identity, mtime)`` where ``stat_identity``
+    is ``(st_dev, st_ino, st_size)`` and ``mtime`` is the file's last
+    modification time.  A later re-stat that disagrees is the W2-003
+    "state changed during validation" signal.
+    """
+    stat = os.stat(state_path, follow_symlinks=True)
+    return (
+        state_path,
+        state_path.read_bytes(),
+        (stat.st_dev, stat.st_ino, stat.st_size),
+        stat.st_mtime,
+    )
+
+
+def _state_snapshot_unchanged(snapshot) -> bool:
+    path, _bytes, identity, mtime = snapshot
+    current = os.stat(path, follow_symlinks=True)
+    return (
+        (current.st_dev, current.st_ino, current.st_size) == identity
+        and current.st_mtime == mtime
+    )
+
 
 def _validate_package(
     contract_path: Path,
@@ -1093,9 +1330,18 @@ def _validate_package(
     if logical_root is None:
         logical_root = _require_coherent_root(contract_path, conf_path, skill_path)
     contract_id, config = _validate(resolved)
-    validate_drift(logical_root)
+    # W2-003: capture bound state identity before scanning, scan, then
+    # verify the state file's identity has not changed.
+    state_snapshot = None
     if state_path is not None:
+        state_snapshot = _capture_state_snapshot(state_path)
         validate_state(state_path, contract_id)
+    validate_drift(logical_root)
+    if state_snapshot is not None and not _state_snapshot_unchanged(state_snapshot):
+        raise SaitalkError(
+            "state changed during validation: "
+            f"{state_path} identity diverged; re-run validate"
+        )
     _assert_manifest_stable((contract_path, conf_path, skill_path), resolved)
     return contract_id, config
 
@@ -1106,19 +1352,57 @@ def validate_package(
     skill_path: Path,
     state_path: Path | None = None,
 ) -> tuple[str, dict[str, str]]:
-    """Validate manifest, active-root drift, and optional bound state in one
-    coherent-locked path (CORE-005 / W2-001 / W2-002).
+    """Validate manifest, drift, and optional bound state with bounded
+    manifest-lock scope (CORE-005 / W2-001 / W2-002 / W2-003 / PERF-002).
+
+    Phase 1 acquires manifest locks, reads the three manifest members
+    exactly once, validates the contract/config/structure, and captures
+    the optional state file's bytes and stat identity.  The manifest
+    locks are then released so phase 2's drift scan does not block
+    concurrent refresh/print-id on the manifest.  Phase 3 re-acquires
+    the manifest locks and proves the manifest referents and bytes are
+    still identical to the Phase-1 capture before returning PASS.
     """
     resolved = _resolved_manifest_map(contract_path, conf_path, skill_path)
     logical_root = _require_coherent_root(contract_path, conf_path, skill_path)
-    locks = _acquire_locks(list(resolved.values()))
+    canonical_targets = sorted(resolved.values(), key=lambda p: str(p.resolve()))
+    manifest_bytes: dict[str, bytes] = {}
+
+    # Phase 1: manifest snapshot under lock.
+    locks1 = _acquire_locks(canonical_targets)
     try:
-        return _validate_package(
-            contract_path, conf_path, skill_path, state_path,
-            resolved=resolved, logical_root=logical_root,
-        )
+        for label, path in resolved.items():
+            manifest_bytes[label] = read_bytes(path)
+        contract_id, config = _validate(resolved)
+        state_snapshot = None
+        if state_path is not None:
+            state_snapshot = _capture_state_snapshot(state_path)
     finally:
-        _release_locks(locks)
+        _release_locks(locks1)
+
+    # Phase 2: drift and (snapshot) state validation without manifest lock.
+    if state_snapshot is not None:
+        validate_state_bytes(state_snapshot[1], contract_id)
+    validate_drift(logical_root)
+
+    if state_snapshot is not None and not _state_snapshot_unchanged(state_snapshot):
+        raise SaitalkError(
+            "state changed during validation: "
+            f"{state_path} identity diverged; re-run validate"
+        )
+
+    # Phase 3: manifest stability re-check under lock.
+    locks2 = _acquire_locks(canonical_targets)
+    try:
+        for label, path in resolved.items():
+            if read_bytes(path) != manifest_bytes[label]:
+                raise SaitalkError(
+                    f"manifest member {label} changed during validation; "
+                    "aborting to avoid a stale result"
+                )
+        return contract_id, config
+    finally:
+        _release_locks(locks2)
 
 
 def root_paths() -> tuple[Path, Path, Path]:

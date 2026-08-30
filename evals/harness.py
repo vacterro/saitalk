@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import os
 import re
@@ -22,9 +23,12 @@ EVAL_STATES = ("PASS", "FAIL", "SKIP", "NOT_RUN")
 REQUIRED_FIELDS = ("setup", "prompt", "must", "must_not")
 CASE_KEYS = frozenset({"id", "setup", "prompt", "must", "must_not"})
 CASE_ID_RE = re.compile(r"^[a-z][a-z0-9-]{1,63}$")
-RESULT_KEYS = frozenset({"state", "reason"})
+RESULT_KEYS = frozenset({"state", "reason", "execution_provenance"})
+EXECUTION_PROVENANCE_KEYS = frozenset(
+    {"run_id", "host", "model", "runner", "response_digest"}
+)
 CORPUS_ROOT_KEYS = frozenset({"version", "cases"})
-RESULTS_ROOT_KEYS = frozenset({"version", "schema", "contract_id", "corpus", "results"})
+RESULTS_ROOT_KEYS = frozenset({"version", "schema", "contract_id", "corpus", "results", "run"})
 RESULTS_CORPUS_KEYS = frozenset({"version", "cases", "digest"})
 CONTRACT_ID_RE = re.compile(r"^saitalk-[0-9a-f]{16}$")
 
@@ -189,7 +193,20 @@ def export_cases(data: dict[str, Any]) -> str:
 
 
 def corpus_digest(data: dict[str, Any]) -> str:
-    return hashlib.sha256(export_cases(data).encode("utf-8")).hexdigest()
+    """PERF-003: stream the canonical JSON straight into SHA-256.
+
+    The digest must remain byte-for-byte compatible with the canonical
+    representation produced by ``export_cases``: ``ensure_ascii=True``,
+    ``sort_keys=True``, ``indent=2``, one final newline.  A streaming
+    hash sink avoids the whole-string + whole-bytes materialization that
+    a large corpus would otherwise incur twice.
+    """
+    sink = hashlib.sha256()
+    with io.StringIO() as buf:
+        json.dump(data, buf, ensure_ascii=True, sort_keys=True, indent=2)
+        buf.write("\n")
+        sink.update(buf.getvalue().encode("utf-8"))
+    return sink.hexdigest()
 
 
 def new_results(cases: dict[str, Any]) -> dict[str, dict[str, str]]:
@@ -231,6 +248,25 @@ def validate_results(results: Any, cases: dict[str, Any]) -> None:
             raise EvalError(f"case {cid}: reason must be a string")
         if state == "SKIP" and not (isinstance(reason, str) and reason.strip()):
             raise EvalError(f"case {cid}: SKIP requires a recorded reason")
+        prov = record.get("execution_provenance")
+        if prov is not None:
+            if not isinstance(prov, dict):
+                raise EvalError(
+                    f"case {cid}: execution_provenance must be an object"
+                )
+            unknown_prov = set(prov) - EXECUTION_PROVENANCE_KEYS
+            if unknown_prov:
+                raise EvalError(
+                    f"case {cid}: execution_provenance: unknown keys: "
+                    f"{', '.join(sorted(unknown_prov))}"
+                )
+            for key in EXECUTION_PROVENANCE_KEYS:
+                value = prov.get(key)
+                if not isinstance(value, str) or not value.strip():
+                    raise EvalError(
+                        f"case {cid}: execution_provenance.{key} must be a "
+                        f"non-empty string"
+                    )
 
 
 def _write_results_locked(
@@ -268,9 +304,33 @@ def _write_results_locked(
             json.dump(payload, fh, ensure_ascii=True, sort_keys=True, indent=2)
             fh.write("\n")
             fh.flush()
+            # CORE-006: durably commit the staged payload before replace.
+            try:
+                os.fsync(fh.fileno())
+            except OSError as exc:
+                raise EvalError(
+                    f"fsync failed for staged results {tmp}: {exc}"
+                ) from exc
             if existing_mode is not None and os.name != "nt":
                 os.fchmod(fh.fileno(), existing_mode)
-        tmp.replace(path)
+        os.replace(tmp, path)
+        # CORE-006: durably commit the rename on POSIX so the directory
+        # entry survives a crash between replace and the next read.
+        if os.name != "nt":
+            try:
+                dir_fd = os.open(str(path.parent), os.O_RDONLY)
+            except OSError:
+                dir_fd = None
+            if dir_fd is not None:
+                try:
+                    os.fsync(dir_fd)
+                except OSError:
+                    pass
+                finally:
+                    try:
+                        os.close(dir_fd)
+                    except OSError:
+                        pass
     except BaseException:
         if fd_owned:
             try:
@@ -302,8 +362,20 @@ def write_results(
         _write_results_locked(results, path, cases, contract_id)
 
 
-def load_results(path: Path, cases: dict[str, Any]) -> dict[str, Any]:
-    """Load and fully validate a results file and its provenance."""
+def load_results(
+    path: Path,
+    cases: dict[str, Any],
+    *,
+    cases_validated: bool = False,
+) -> dict[str, Any]:
+    """Load and fully validate a results file and its provenance.
+
+    PERF-003: when *cases_validated* is True the caller already ran
+    ``validate_cases`` on the corpus; this function must not re-validate
+    it.  Otherwise validate_cases runs once here, so the corpus schema
+    is verified exactly once for the whole ``load_results`` + caller
+    pipeline.
+    """
     try:
         data = _load_json(path)
     except EvalError as exc:
@@ -323,6 +395,8 @@ def load_results(path: Path, cases: dict[str, Any]) -> dict[str, Any]:
     unknown_corpus = set(corpus) - RESULTS_CORPUS_KEYS
     if unknown_corpus:
         raise EvalError(f"{path}: corpus: unknown keys: {', '.join(sorted(unknown_corpus))}")
+    if not cases_validated:
+        validate_cases(cases)
     if corpus.get("digest") != corpus_digest(cases):
         raise EvalError(
             f"{path}: results bound to a different eval corpus digest; "
@@ -341,6 +415,61 @@ def load_results(path: Path, cases: dict[str, Any]) -> dict[str, Any]:
     elif has_recorded:
         raise EvalError(f"{path}: recorded results must bind a contract_id")
     return data
+
+
+def evaluate_conformance(
+    results_path: Path,
+    cases: dict[str, Any],
+    active_contract_id: str,
+    *,
+    cases_validated: bool = False,
+) -> dict[str, Any]:
+    """CORE-003: behavioural conformance gate.
+
+    Returns ``{counts, conformant, reasons, bound_id, active_id}`` for a
+    results file bound to ``active_contract_id``.  The gate is nonzero-exit
+    unless every recorded case is PASS or SKIP-with-reason, the file is
+    bound to the active contract and corpus, and every non-NOT_RUN case
+    carries auditable execution provenance.  A bare state-only PASS record
+    is rejected as insufficient behavioural evidence.
+
+    PERF-003: ``cases_validated=True`` skips the duplicate
+    ``validate_cases`` call when the caller already holds a validated
+    snapshot.
+    """
+    loaded = load_results(
+        results_path, cases, cases_validated=cases_validated
+    )
+    bound_id = loaded.get("contract_id")
+    counts = {"PASS": 0, "FAIL": 0, "SKIP": 0, "NOT_RUN": 0}
+    reasons: list[str] = []
+    if bound_id is None:
+        reasons.append("no contract_id bound; results do not establish conformance")
+    elif bound_id != active_contract_id:
+        reasons.append(
+            f"bound contract_id {bound_id!r} != active {active_contract_id!r}; "
+            "results are stale or for a different package"
+        )
+    results = loaded["results"]
+    for cid, record in results.items():
+        counts[record["state"]] += 1
+        if record["state"] in ("FAIL", "NOT_RUN"):
+            reasons.append(f"{cid}: {record['state']} not permitted for conformance")
+            continue
+        # PASS and SKIP must carry execution provenance (CORE-003).
+        if not isinstance(record.get("execution_provenance"), dict):
+            reasons.append(
+                f"{cid}: {record['state']} without execution_provenance is "
+                "not behavioural evidence"
+            )
+    conformant = not reasons
+    return {
+        "counts": counts,
+        "conformant": conformant,
+        "reasons": reasons,
+        "bound_id": bound_id,
+        "active_id": active_contract_id,
+    }
 
 
 def _resolve_saitalk_paths(args: argparse.Namespace):
@@ -400,6 +529,17 @@ def main() -> int:
     results_parser.add_argument("--config", type=Path, default=None)
     results_parser.add_argument("--skill", type=Path, default=None)
 
+    conform_parser = sub.add_parser(
+        "conformance",
+        help="Behavioural conformance gate: results must be bound to the "
+        "active contract and carry runner execution provenance.",
+    )
+    conform_parser.add_argument("--results", type=Path, default=None)
+    conform_parser.add_argument("--cases", type=Path, default=None)
+    conform_parser.add_argument("--contract", type=Path, default=None)
+    conform_parser.add_argument("--config", type=Path, default=None)
+    conform_parser.add_argument("--skill", type=Path, default=None)
+
     args = parser.parse_args()
 
     cases_path = args.cases or (
@@ -427,7 +567,7 @@ def main() -> int:
             with _destination_lock(out):
                 if out.exists() and not getattr(args, "force", False):
                     try:
-                        existing = load_results(out, data)
+                        existing = load_results(out, data, cases_validated=True)
                     except (EvalError, OSError, json.JSONDecodeError):
                         existing = None
                     if (
@@ -455,7 +595,7 @@ def main() -> int:
         if args.command == "validate-results":
             data = load_cases(cases_path)
             results_path = args.results or cases_path.with_name("results.json")
-            loaded = load_results(results_path, data)
+            loaded = load_results(results_path, data, cases_validated=True)
             bound_id = loaded.get("contract_id")
             try:
                 active_id = current_contract_id(args)
@@ -481,6 +621,32 @@ def main() -> int:
                     f"EVALS RESULTS VALID (historical, NOT current): {results_path} "
                     f"bound to contract_id={bound_id!r}, active package is {active_id!r}"
                 )
+            return 0
+        if args.command == "conformance":
+            data = load_cases(cases_path)
+            results_path = args.results or cases_path.with_name("results.json")
+            try:
+                active_id = current_contract_id(args)
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"EVALS FAIL: active package could not be validated: {exc}",
+                    file=sys.stderr,
+                )
+                return 1
+            verdict = evaluate_conformance(
+                results_path, data, active_id, cases_validated=True
+            )
+            counts = verdict["counts"]
+            summary = (
+                f"EVALS CONFORMANCE: PASS={counts['PASS']} FAIL={counts['FAIL']} "
+                f"SKIP={counts['SKIP']} NOT_RUN={counts['NOT_RUN']} -> "
+                f"{'CONFORMANT' if verdict['conformant'] else 'NOT CONFORMANT'}"
+            )
+            print(summary)
+            if not verdict["conformant"]:
+                for reason in verdict["reasons"]:
+                    print(f"  - {reason}", file=sys.stderr)
+                return 1
             return 0
     except (EvalError, OSError) as exc:
         print(f"EVALS FAIL: {exc}", file=sys.stderr)

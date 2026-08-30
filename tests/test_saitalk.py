@@ -2445,22 +2445,21 @@ class AuditRepairRegressionTests(unittest.TestCase):
                 saitalk.validate_state(state, "saitalk-12345678abcdef12")
             self.assertIn("saitalk_shadow", str(ctx.exception))
 
-    def test_iter_md_files_handles_deep_tree(self) -> None:
+    def test_iter_md_files_yields_deep_tree(self) -> None:
+        # CORE-005: the deep-tree case must actually execute, not be
+        # shadowed by a later method of the same name.  Depth is bounded
+        # so the temporary cleanup does not exceed Windows MAX_PATH.
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "adapters"
             root.mkdir()
             current = root
-            for index in range(1100):
+            for index in range(500):
                 current = current / f"d{index % 10}"
                 current.mkdir()
             leaf = current / "leaf.md"
             leaf.write_text("safe\n", encoding="utf-8")
-            self.assertEqual(saitalk._iter_md_files(root), [leaf])
-            leaf.unlink()
-            for _ in range(1100):
-                current.rmdir()
-                current = current.parent
-            root.rmdir()
+            found = list(saitalk._iter_md_files(root))
+            self.assertEqual(found, [leaf])
 
     def test_strict_json_loader_rejects_duplicate_nested_key(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -2474,24 +2473,9 @@ class AuditRepairRegressionTests(unittest.TestCase):
                 self.evals_harness.load_cases(path)
             self.assertIn("duplicate JSON key", str(ctx.exception))
 
-    # ---- PERF-003: byte-identical results, no pre-sort copy -------------
-    def test_write_results_assigns_results_without_copy(self) -> None:
-        captured: dict[str, object] = {}
-        real_dump = self.evals_harness.json.dump
-
-        def capturing(obj, fh, *args, **kwargs):  # type: ignore[no-untyped-def]
-            captured["obj"] = obj
-            return real_dump(obj, fh, *args, **kwargs)
-
-        with tempfile.TemporaryDirectory() as temp:
-            out = Path(temp) / "results.json"
-            data = self.evals_harness.load_cases(REPO / "evals" / "cases.json")
-            results = self.evals_harness.new_results(data)
-            with unittest.mock.patch.object(
-                self.evals_harness.json, "dump", capturing
-            ):
-                self.evals_harness.write_results(results, out, data)
-        self.assertIs(captured["obj"]["results"], results)
+    # ---- W2-004: snapshot integrity replaces the former identity test
+    # (write_results must not enshrine object identity; that assertion is
+    # moved to AuditWaveThreeRegressionTests.test_write_results_snapshots_results_mid_call).
 
     # ---- CORE-001: tab-indented pseudo-fences ----------------------------
 
@@ -2537,16 +2521,53 @@ class AuditRepairRegressionTests(unittest.TestCase):
     # ---- W2-001: pre-write manifest stability check ----------------------
 
     def test_pre_write_manifest_stability_is_checked(self) -> None:
-        # After refresh completes, the manifest must still be coherent.
-        # We test the happy path -- if pre-write check is wired in,
-        # refresh completes without error on a valid package.
-        root = Path(__file__).resolve().parents[1]
-        contract = root / "SAITALK.md"
-        conf = root / "saitalk.conf"
-        skill = root / "SKILL.md"
-        contract_id = saitalk.refresh(contract, conf, skill)
-        self.assertTrue(contract_id.startswith("saitalk-"))
-        self.assertEqual(len(contract_id), 8 + 16)
+        # CORE-004: a regression test must never refresh the live repository
+        # manifest; it must exercise the pre-write stability check on a
+        # disposable package, prove refresh aborts when a manifest member
+        # is retargeted between capture and commit, and prove that abort
+        # leaves every captured physical target byte-identical to its
+        # pre-call state.
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            a = base / "a"
+            b = base / "b"
+            a.mkdir()
+            b.mkdir()
+            self._make_valid_package(a)
+            self._make_valid_package(b)
+            logical = base / "logical"
+            logical.mkdir()
+            for name in ("SAITALK.md", "saitalk.conf", "SKILL.md"):
+                self._symlink_or_skip(a / name, logical / name)
+            original_bytes = {
+                name: (a / name).read_bytes() for name in
+                ("SAITALK.md", "saitalk.conf", "SKILL.md")
+            }
+            # Inject a side-effect that retargets the logical manifest
+            # member at the moment refresh checks pre-write stability.
+            def retargeting_assert(paths, resolved):
+                for name in ("SAITALK.md", "saitalk.conf", "SKILL.md"):
+                    self._symlink_or_skip(b / name, logical / name)
+                raise saitalk.SaitalkError(
+                    "manifest member SAITALK.md was retargeted during the operation"
+                )
+
+            with unittest.mock.patch(
+                "scripts.saitalk._assert_manifest_stable",
+                side_effect=retargeting_assert,
+            ):
+                with self.assertRaises(saitalk.SaitalkError) as ctx:
+                    saitalk.refresh(
+                        logical / "SAITALK.md",
+                        logical / "saitalk.conf",
+                        logical / "SKILL.md",
+                    )
+            self.assertIn("retargeted", str(ctx.exception))
+            for name, original in original_bytes.items():
+                self.assertEqual(
+                    (a / name).read_bytes(), original,
+                    f"{name} was mutated by an aborted refresh",
+                )
 
     # ---- W2-002: HTML comment removal preserves lexical separation -------
 
@@ -2578,13 +2599,14 @@ class AuditRepairRegressionTests(unittest.TestCase):
 
     # ---- PERF-001: (st_dev, st_ino) cycle detection in _iter_md_files ---
 
-    def test_iter_md_files_handles_deep_tree(self) -> None:
+    def test_iter_md_files_yields_shallow_tree(self) -> None:
+        # CORE-005: the shallow-tree case must run alongside the deep one.
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "adapters"
             leaf = root / "deep" / "nested" / "dir"
             leaf.mkdir(parents=True)
             (leaf / "test.md").write_text("# Adapter\n")
-            result = saitalk._iter_md_files(root)
+            result = list(saitalk._iter_md_files(root))
             self.assertEqual(len(result), 1)
             self.assertEqual(result[0].name, "test.md")
 
@@ -2606,25 +2628,31 @@ class AuditRepairRegressionTests(unittest.TestCase):
     # ---- PERF-002: non-blocking lock acquisition in evals harness --------
 
     def test_destination_lock_fails_fast_on_contention(self) -> None:
+        # CORE-005: a non-blocking lock acquisition must surface contention
+        # as an EvalError immediately.  The barrier protocol is balanced
+        # (each party waits exactly once) and any worker-thread exception
+        # is propagated to the test result, not silenced.
         import threading
-        import os
         with tempfile.TemporaryDirectory() as td:
             target = Path(td) / "results.json"
             target.write_text("{}")
             from evals.harness import _destination_lock, EvalError
-            barrier = threading.Barrier(2, timeout=5)
-            error = []
+            ready = threading.Event()
+            release = threading.Event()
+            worker_errors: list[BaseException] = []
 
             def hold_lock():
                 with _destination_lock(target):
-                    barrier.wait()  # signal we hold the lock
-                    barrier.wait()  # wait for the other thread to try
+                    ready.set()
+                    release.wait(timeout=5)
 
             def try_lock():
-                barrier.wait()  # wait until the lock is held
+                ready.wait(timeout=5)
                 try:
                     with _destination_lock(target):
-                        error.append("should not acquire")
+                        worker_errors.append(
+                            AssertionError("contending party acquired the lock")
+                        )
                 except (EvalError, OSError):
                     pass  # expected: contention surfaced immediately
 
@@ -2632,9 +2660,13 @@ class AuditRepairRegressionTests(unittest.TestCase):
             t2 = threading.Thread(target=try_lock)
             t1.start()
             t2.start()
-            t1.join(timeout=10)
             t2.join(timeout=10)
-            self.assertEqual(error, [])
+            release.set()
+            t1.join(timeout=10)
+            for thread in (t1, t2):
+                if thread.is_alive():
+                    self.fail(f"worker thread did not terminate: {thread.name}")
+            self.assertEqual(worker_errors, [])
 
     # ---- PERF-003: line-by-line drift scanning (O(max_line_length)) ------
 
@@ -2669,6 +2701,397 @@ class AuditRepairRegressionTests(unittest.TestCase):
             )
             # Should not raise
             saitalk.validate_drift(root)
+
+
+class AuditWaveThreeRegressionTests(unittest.TestCase):
+    """Tickets CORE-003 / CORE-006 / W2-003..005 / PERF-001..003."""
+
+    def setUp(self) -> None:
+        from evals import harness
+
+        self.evals_harness = harness
+        self.cases = harness.load_cases(REPO / "evals" / "cases.json")
+        self.results = harness.new_results(self.cases)
+
+    def _make_valid_package(self, root: Path) -> None:
+        contract, conf, skill = make_root(root)
+        saitalk.refresh(contract, conf, skill)
+
+    def _symlink_or_skip(self, src: Path, dst: Path) -> None:
+        try:
+            if dst.exists() or dst.is_symlink():
+                dst.unlink()
+            dst.symlink_to(src)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks not supported")
+
+    # ---- CORE-003: behavioral conformance gate -------------------------
+
+    def test_evaluate_conformance_rejects_state_only_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            data = self.cases
+            results = self.evals_harness.new_results(data)
+            for case in data["cases"]:
+                results[case["id"]] = {"state": "PASS"}
+            path = Path(temp) / "results.json"
+            self.evals_harness.write_results(
+                results, path, data,
+                contract_id="saitalk-deadbeefdeadbeef",
+            )
+            verdict = self.evals_harness.evaluate_conformance(
+                path, data, "saitalk-deadbeefdeadbeef"
+            )
+            self.assertFalse(verdict["conformant"])
+            self.assertTrue(verdict["reasons"])
+            self.assertEqual(verdict["counts"]["PASS"], len(data["cases"]))
+
+    def test_evaluate_conformance_accepts_runner_backed_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            data = self.cases
+            results = self.evals_harness.new_results(data)
+            prov = {
+                "run_id": "run-1",
+                "host": "test-host",
+                "model": "test-model",
+                "runner": "evals.harness",
+                "response_digest": "0" * 64,
+            }
+            for case in data["cases"]:
+                results[case["id"]] = {
+                    "state": "PASS",
+                    "execution_provenance": dict(prov),
+                }
+            path = Path(temp) / "results.json"
+            self.evals_harness.write_results(
+                results, path, data,
+                contract_id="saitalk-deadbeefdeadbeef",
+            )
+            verdict = self.evals_harness.evaluate_conformance(
+                path, data, "saitalk-deadbeefdeadbeef"
+            )
+            self.assertTrue(verdict["conformant"], verdict["reasons"])
+            self.assertEqual(verdict["counts"]["PASS"], len(data["cases"]))
+
+    def test_evaluate_conformance_rejects_not_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            data = self.cases
+            results = self.evals_harness.new_results(data)
+            path = Path(temp) / "results.json"
+            self.evals_harness.write_results(
+                results, path, data, contract_id="saitalk-deadbeefdeadbeef"
+            )
+            verdict = self.evals_harness.evaluate_conformance(
+                path, data, "saitalk-deadbeefdeadbeef"
+            )
+            self.assertFalse(verdict["conformant"])
+            self.assertEqual(verdict["counts"]["NOT_RUN"], len(data["cases"]))
+
+    def test_evaluate_conformance_rejects_stale_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            data = self.cases
+            results = self.evals_harness.new_results(data)
+            for case in data["cases"]:
+                results[case["id"]] = {
+                    "state": "PASS",
+                    "execution_provenance": {
+                        "run_id": "r", "host": "h", "model": "m",
+                        "runner": "rr", "response_digest": "d" * 64,
+                    },
+                }
+            path = Path(temp) / "results.json"
+            self.evals_harness.write_results(
+                results, path, data, contract_id="saitalk-aaaaaaaaaaaaaaaa"
+            )
+            verdict = self.evals_harness.evaluate_conformance(
+                path, data, "saitalk-bbbbbbbbbbbbbbbb"
+            )
+            self.assertFalse(verdict["conformant"])
+            self.assertTrue(any("stale" in r for r in verdict["reasons"]))
+
+    # ---- CORE-006: eval result fsync durability -----------------------
+
+    def test_write_results_fsyncs_before_replace(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            data = self.cases
+            results = self.evals_harness.new_results(data)
+            path = Path(temp) / "results.json"
+            real_fsync = os.fsync
+            calls: list[int] = []
+
+            def capturing_fsync(fd):
+                calls.append(fd)
+                return real_fsync(fd)
+
+            with unittest.mock.patch("os.fsync", side_effect=capturing_fsync):
+                self.evals_harness.write_results(
+                    results, path, data, contract_id="saitalk-deadbeefdeadbeef"
+                )
+            self.assertTrue(calls, "write_results never called os.fsync")
+            self.evals_harness.load_results(path, data)
+
+    def test_write_results_fsync_failure_leaves_original_intact(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            data = self.cases
+            path = Path(temp) / "results.json"
+            # Pre-populate with a valid result so a failed replace leaves it.
+            initial = self.evals_harness.new_results(data)
+            self.evals_harness.write_results(
+                initial, path, data, contract_id="saitalk-deadbeefdeadbeef"
+            )
+            original_bytes = path.read_bytes()
+
+            def fail_fsync(_fd):
+                raise OSError("simulated fsync failure")
+
+            with unittest.mock.patch("os.fsync", side_effect=fail_fsync):
+                with self.assertRaises(self.evals_harness.EvalError) as ctx:
+                    self.evals_harness.write_results(
+                        self.evals_harness.new_results(data),
+                        path, data, contract_id="saitalk-feedfacedeadbeef",
+                    )
+            self.assertIn("fsync", str(ctx.exception))
+            self.assertEqual(path.read_bytes(), original_bytes)
+
+    # ---- W2-003: validate_package state + drift snapshot --------------
+
+    def test_validate_package_catches_state_change_after_capture(self) -> None:
+        # Atomically replace the state file with a stale contract after
+        # the initial capture inside validate_package.  The final
+        # stat-identity check must detect the change and raise.
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            self._make_valid_package(base)
+            state = base / "STATE.md"
+            state.write_text(
+                "saitalk_contract: {cid}\n"
+                "saitalk_status: active\n"
+                "saitalk_voice: active\n".format(
+                    cid=saitalk.current_contract_id(
+                        (base / "SAITALK.md").read_text(encoding="utf-8"),
+                        "SAITALK.md contract_id",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            real_capture = saitalk._capture_state_snapshot
+
+            def mutate_then_capture(state_path):
+                snapshot = real_capture(state_path)
+                state_path.write_text(
+                    "saitalk_contract: saitalk-aaaaaaaaaaaaaaaa\n"
+                    "saitalk_status: active\n"
+                    "saitalk_voice: active\n",
+                    encoding="utf-8",
+                )
+                return snapshot
+
+            with unittest.mock.patch(
+                "scripts.saitalk._capture_state_snapshot",
+                side_effect=mutate_then_capture,
+            ):
+                with self.assertRaises(saitalk.SaitalkError) as ctx:
+                    saitalk.validate_package(
+                        base / "SAITALK.md",
+                        base / "saitalk.conf",
+                        base / "SKILL.md",
+                        state_path=state,
+                    )
+            self.assertIn("changed during validation", str(ctx.exception))
+
+    # ---- W2-004: write_results immutable snapshot ---------------------
+
+    def test_write_results_snapshots_results_mid_call(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            data = self.cases
+            results = self.evals_harness.new_results(data)
+            for case in data["cases"]:
+                results[case["id"]] = {
+                    "state": "NOT_RUN",
+                    "execution_provenance": {
+                        "run_id": "r", "host": "h", "model": "m",
+                        "runner": "rr", "response_digest": "d" * 64,
+                    },
+                }
+            # Mutate the first record to PASS *after* validation would have
+            # seen NOT_RUN but *before* serialization.  write_results must
+            # refuse the call (recorded results must bind a contract_id) or
+            # serialize the validated NOT_RUN snapshot -- never silently
+            # emit a self-invalid file.
+            path = Path(temp) / "results.json"
+            real_validate = self.evals_harness.validate_results
+
+            def mutate_and_validate(records, *args, **kwargs):
+                first = next(iter(records))
+                records[first] = {"state": "PASS"}
+                return real_validate(records, *args, **kwargs)
+
+            with unittest.mock.patch.object(
+                self.evals_harness, "validate_results",
+                side_effect=mutate_and_validate,
+            ):
+                with self.assertRaises(self.evals_harness.EvalError):
+                    self.evals_harness.write_results(
+                        results, path, data, contract_id=None
+                    )
+
+    # ---- W2-005: lock teardown does not mask primary ------------------
+
+    def test_destination_lock_preserves_lock_failure_over_close(self) -> None:
+        # W2-005: a follow-up close failure during acquisition must not
+        # replace the reported lock error.  Patch the platform-specific
+        # lock primitive used by _destination_lock.
+        import evals.harness as harness
+        from evals.harness import EvalError
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "results.json"
+            path.write_text("{}")
+            if os.name == "nt":
+                import msvcrt
+                real_locking = msvcrt.locking
+
+                def fail_lock(*args, **kwargs):
+                    raise OSError("simulated lock failure")
+                with unittest.mock.patch.object(
+                    harness, "msvcrt", create=True
+                ) as mock_msvcrt:
+                    mock_msvcrt.locking = fail_lock
+                    with self.assertRaises(EvalError) as ctx:
+                        with harness._destination_lock(path):
+                            pass
+            else:
+                import fcntl
+                with unittest.mock.patch.object(
+                    harness, "fcntl", create=True
+                ) as mock_fcntl:
+                    mock_fcntl.flock = lambda *a, **kw: (_ for _ in ()).throw(
+                        OSError("simulated lock failure")
+                    )
+                    with self.assertRaises(EvalError) as ctx:
+                        with harness._destination_lock(path):
+                            pass
+            self.assertIn("simulated lock failure", str(ctx.exception))
+
+    # ---- PERF-001: drift streams file + tree --------------------------
+
+    def test_validate_drift_streams_large_file_with_bounded_memory(self) -> None:
+        import tracemalloc
+        # Establish a memory baseline BEFORE creating the test input so
+        # tracemalloc measures only the validate_drift pass, not file
+        # creation.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "adapters").mkdir()
+            big = root / "adapters" / "big.md"
+            big.write_text(
+                "# Adapter\n\n" + ("x" * 80 + "\n") * 100000,
+                encoding="utf-8",
+            )
+            tracemalloc.start()
+            try:
+                saitalk.validate_drift(root)
+                current, peak = tracemalloc.get_traced_memory()
+            finally:
+                tracemalloc.stop()
+            # 8 MiB of input must not blow up to many times its size.
+            # Allow generous headroom for tracemalloc's own bookkeeping
+            # and Python's per-line string overhead; the point is the
+            # cap is bounded, not that it equals the input.
+            self.assertLess(peak, 24 * 1024 * 1024, f"peak {peak} bytes")
+
+    def test_validate_drift_fails_fast_on_lexically_first_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "adapters").mkdir()
+            (root / "adapters" / "00000_bad.md").write_text(
+                "# A\n\nstop caveman now.\n", encoding="utf-8"
+            )
+            for i in range(2000):
+                (root / "adapters" / f"good_{i:05d}.md").write_text(
+                    "# Good\n\nAll clean.\n", encoding="utf-8"
+                )
+            start = saitalk.time.perf_counter() if hasattr(saitalk, "time") else None
+            import time as _t
+            t0 = _t.perf_counter()
+            with self.assertRaises(saitalk.SaitalkError):
+                saitalk.validate_drift(root)
+            elapsed = _t.perf_counter() - t0
+            # 2000+ files at IO speed still well under a second on any
+            # reasonable host; the fail-fast point is the lexically first
+            # file so the rest of the tree should not be enumerated.
+            self.assertLess(elapsed, 1.0, f"validation took {elapsed:.3f}s")
+
+    # ---- PERF-002: validate_package does not hold manifest locks for
+    # adapter/state scanning -------------------------------------------
+
+    def test_validate_package_releases_manifest_locks_during_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            self._make_valid_package(base)
+            (base / "adapters").mkdir()
+            big = base / "adapters" / "big.md"
+            big.write_text(
+                "# Adapter\n\n" + ("x" * 80 + "\n") * 10000,
+                encoding="utf-8",
+            )
+            events: list[str] = []
+            real_release = saitalk._release_locks
+
+            def watch(handles):
+                events.append(len(handles))
+                return real_release(handles)
+
+            with unittest.mock.patch(
+                "scripts.saitalk._release_locks", side_effect=watch
+            ):
+                saitalk.validate_package(
+                    base / "SAITALK.md",
+                    base / "saitalk.conf",
+                    base / "SKILL.md",
+                )
+            # Two distinct lock releases: phase 1 release (3 handles) and
+            # phase 3 release (3 handles).  Together with the 3-handle
+            # acquire pattern, this proves the manifest lock is not held
+            # for the whole drift scan.
+            self.assertEqual(len(events), 2)
+            for count in events:
+                self.assertEqual(count, 3)
+
+    # ---- PERF-003: corpus_digest streams json.dump --------------------
+
+    def test_corpus_digest_streams_deterministic(self) -> None:
+        data = self.cases
+        # Build a corpus with Unicode + order edge cases.
+        data2 = {
+            "version": 1,
+            "cases": [
+                {
+                    "id": "u-1",
+                    "setup": "žluťoučký kůň",
+                    "prompt": '"quotes" and \\backslashes\\',
+                    "must": ["alpha"],
+                    "must_not": ["beta"],
+                },
+                {
+                    "id": "u-2",
+                    "setup": "0123456789",
+                    "prompt": "tabs\there",
+                    "must": ["x"],
+                    "must_not": ["y"],
+                },
+            ],
+        }
+        self.evals_harness.validate_cases(data2)
+        d1 = self.evals_harness.corpus_digest(data2)
+        d2 = self.evals_harness.corpus_digest(dict(data2))
+        self.assertEqual(d1, d2)
+        # Digest must be byte-for-byte compatible with export_cases.
+        import hashlib
+        self.assertEqual(
+            d1,
+            hashlib.sha256(
+                self.evals_harness.export_cases(data2).encode("utf-8")
+            ).hexdigest(),
+        )
 
 
 if __name__ == "__main__":

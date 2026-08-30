@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.1.11 - 2026-08-30
+
+Audit-driven repair release on top of v0.1.10. Implements the remaining
+AUDIT_ALL_3 tickets: the live-source lexer now decides fence validity on the
+original line bytes so HTML-comment elision can never synthesise or destroy a
+fence, and HTML-comment delimiters inside backtick code spans are literal
+text (CORE-001 / W2-001); `refresh` rolls back every target on any
+unsuccessful exit including cancellation and keeps cancellation identity
+(W2-002); package validation captures drift and bound state with before/after
+stability evidence and splits manifest-lock scope from adapter/state scanning
+(W2-003 / PERF-002); drift validation streams files and trees end-to-end with
+bounded memory and fail-fast early invalid files (PERF-001); eval result
+writing validates and serialises one immutable snapshot that always
+round-trips, plus durable fsync before atomic replace (CORE-006 / W2-004 /
+PERF-003); lock teardown never masks primary failures (W2-005); audit
+regressions no longer touch the live repository or shadow each other
+(CORE-004 / CORE-005); and the eval harness gains a real behavioral
+conformance gate that requires runner-backed execution provenance
+(CORE-003). v0.1.10 remains tagged at 2c2294d8; this release advances the
+working tree to a new identity.
+
 ## 0.1.10 - 2026-08-26
 
 Audit-driven repair release. Every item below has a red control in the test
