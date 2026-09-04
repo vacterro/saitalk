@@ -1,5 +1,6 @@
 __pycache__/
 *.py[cod]
-.saipen/
+.saipen/*
+!.saipen/IDENTITY.md
 evals/results.json
 evals/export.json
