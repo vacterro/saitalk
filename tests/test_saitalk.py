@@ -4101,6 +4101,120 @@ class AuditSrc001RegressionTests(unittest.TestCase):
         with self.assertRaises(harness.EvalError):
             harness.validate_results({"BAD-ID": {"state": "NOT_RUN"}}, bad)
 
+    # ---- T-905: destination mode preservation, testable on any host ----
+    #
+    # The real chmod round-trip (test_write_results_preserves_posix_mode) can
+    # only run where the filesystem honours mode bits. These drive the two
+    # decision points directly, so Windows still covers the logic even though
+    # it cannot observe the bits.
+
+    def test_capture_destination_mode_is_none_for_absent_file(self) -> None:
+        harness = self.evals_harness
+        with tempfile.TemporaryDirectory() as temp:
+            self.assertIsNone(
+                harness._capture_destination_mode(Path(temp) / "absent.json")
+            )
+
+    def test_capture_destination_mode_is_none_on_windows(self) -> None:
+        harness = self.evals_harness
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp) / "results.json"
+            out.write_text("{}", encoding="utf-8")
+            with unittest.mock.patch.object(harness.os, "name", "nt"):
+                self.assertIsNone(harness._capture_destination_mode(out))
+
+    def test_capture_destination_mode_reads_bits_on_posix(self) -> None:
+        harness = self.evals_harness
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp) / "results.json"
+            out.write_text("{}", encoding="utf-8")
+            fake = os.stat(out)
+            with unittest.mock.patch.object(harness.os, "name", "posix"):
+                with unittest.mock.patch.object(Path, "is_file", return_value=True):
+                    with unittest.mock.patch.object(
+                        harness.os, "stat", return_value=fake
+                    ):
+                        captured = harness._capture_destination_mode(out)
+            self.assertEqual(captured, fake.st_mode & 0o7777)
+
+    def test_capture_destination_mode_normalizes_stat_failure(self) -> None:
+        harness = self.evals_harness
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp) / "results.json"
+            out.write_text("{}", encoding="utf-8")
+            # is_file() is answered first and independently: patching os.stat
+            # alone would make is_file() report False and take the None branch
+            # instead of reaching the guarded read.
+            with unittest.mock.patch.object(harness.os, "name", "posix"):
+                with unittest.mock.patch.object(Path, "is_file", return_value=True):
+                    with unittest.mock.patch.object(
+                        harness.os, "stat", side_effect=OSError("stat refused")
+                    ):
+                        with self.assertRaises(harness.EvalError) as ctx:
+                            harness._capture_destination_mode(out)
+            self.assertIn("cannot read destination mode", str(ctx.exception))
+
+    def test_apply_destination_mode_is_a_noop_without_a_mode(self) -> None:
+        harness = self.evals_harness
+        with unittest.mock.patch.object(harness.os, "name", "posix"):
+            with unittest.mock.patch.object(
+                harness.os, "fchmod", create=True
+            ) as fchmod:
+                harness._apply_destination_mode(7, None)
+        fchmod.assert_not_called()
+
+    def test_apply_destination_mode_is_a_noop_on_windows(self) -> None:
+        harness = self.evals_harness
+        with unittest.mock.patch.object(harness.os, "name", "nt"):
+            with unittest.mock.patch.object(
+                harness.os, "fchmod", create=True
+            ) as fchmod:
+                harness._apply_destination_mode(7, 0o600)
+        fchmod.assert_not_called()
+
+    def test_apply_destination_mode_chmods_the_staged_descriptor(self) -> None:
+        harness = self.evals_harness
+        with unittest.mock.patch.object(harness.os, "name", "posix"):
+            with unittest.mock.patch.object(
+                harness.os, "fchmod", create=True
+            ) as fchmod:
+                harness._apply_destination_mode(7, 0o640)
+        fchmod.assert_called_once_with(7, 0o640)
+
+    def test_write_results_preserves_the_captured_mode_end_to_end(self) -> None:
+        # The full ordering claim without needing real mode bits: capture the
+        # destination's mode, then apply it to the STAGED descriptor before the
+        # install. Applying it after would chmod a path that no longer exists.
+        harness = self.evals_harness
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp) / "results.json"
+            out.write_text("{}", encoding="utf-8")
+            events: list[str] = []
+            real_replace = os.replace
+
+            def watch_replace(src, dst):
+                events.append("install")
+                return real_replace(src, dst)
+
+            with unittest.mock.patch.object(
+                harness, "_capture_destination_mode", return_value=0o640
+            ) as capture:
+                with unittest.mock.patch.object(
+                    harness, "_apply_destination_mode"
+                ) as apply_mode:
+                    apply_mode.side_effect = lambda fileno, mode: events.append(
+                        f"apply:{mode:o}"
+                    )
+                    with unittest.mock.patch("os.replace", side_effect=watch_replace):
+                        harness.write_results(
+                            harness.new_results(self.cases),
+                            out,
+                            self.cases,
+                            contract_id=None,
+                        )
+            capture.assert_called_once_with(out)
+            self.assertEqual(events, ["apply:640", "install"])
+
 
 if __name__ == "__main__":
     unittest.main()

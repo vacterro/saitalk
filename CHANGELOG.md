@@ -75,6 +75,15 @@ claimed more than they checked: `test_destination_lock_preserves_lock_failure_
 over_close` only ever injected a lock-primitive failure, and
 `test_corpus_digest_streams_deterministic` never measured memory.
 
+Results-file permission preservation was also extracted into
+`_capture_destination_mode` and `_apply_destination_mode`, each owning its own
+platform gate. The behaviour is unchanged on every platform — verified across
+all eight input combinations against the previous inline logic — but the two
+decision points now have local coverage on hosts without POSIX mode bits, where
+they previously had none and could have drifted unnoticed. The real chmod
+round-trip still self-skips there; that is a host capability limit, not an
+untested code path.
+
 ## 0.1.10 - 2026-08-26
 
 Audit-driven repair release. Every item below has a red control in the test

@@ -293,6 +293,38 @@ def validate_results(
                     )
 
 
+def _capture_destination_mode(path: Path) -> int | None:
+    """Return *path*'s POSIX permission bits, or None when there are none.
+
+    None means "no mode to preserve": the destination does not exist yet, or
+    this platform has no POSIX mode bits to carry over.
+
+    T-905: the platform check lives HERE rather than inline at the call site,
+    so the whole preserve-mode decision is one named unit a test can drive on
+    any host. Previously both halves sat behind `os.name != "nt"` inside
+    `_write_results_locked`, which meant the only host that runs this suite
+    had ZERO coverage of them and could not have noticed them drifting.
+    """
+    if os.name == "nt" or not path.is_file():
+        return None
+    try:
+        return os.stat(path).st_mode & 0o7777
+    except OSError as exc:
+        raise EvalError(f"cannot read destination mode: {path}: {exc}") from exc
+
+
+def _apply_destination_mode(fileno: int, mode: int | None) -> None:
+    """Apply a captured destination *mode* to the staged file descriptor.
+
+    Called after the content write and fsync but BEFORE the install, so the
+    replacement carries the original file's permissions instead of mkstemp's
+    private 0o600. A None mode is a no-op, which is also the Windows case.
+    """
+    if mode is None or os.name == "nt":
+        return
+    os.fchmod(fileno, mode)
+
+
 def _fsync_parent_directory(path: Path) -> None:
     """Durably commit *path*'s directory entry after an atomic install.
 
@@ -392,12 +424,7 @@ def _write_results_locked(
     }
     if path.is_symlink():
         raise EvalError(f"write_results refuses to replace symlink destination: {path}")
-    existing_mode = None
-    if os.name != "nt" and path.is_file():
-        try:
-            existing_mode = os.stat(path).st_mode & 0o7777
-        except OSError as exc:
-            raise EvalError(f"cannot read destination mode: {path}: {exc}") from exc
+    existing_mode = _capture_destination_mode(path)
     fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".")
     tmp = Path(tmp_path)
     fd_owned = True
@@ -415,8 +442,7 @@ def _write_results_locked(
                 raise EvalError(
                     f"fsync failed for staged results {tmp}: {exc}"
                 ) from exc
-            if existing_mode is not None and os.name != "nt":
-                os.fchmod(fh.fileno(), existing_mode)
+            _apply_destination_mode(fh.fileno(), existing_mode)
         if must_not_exist:
             _commit_no_clobber(tmp, path)
         else:
