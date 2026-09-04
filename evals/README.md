@@ -46,11 +46,24 @@ Initialize a NOT_RUN result file:
 py -m evals.harness init-results --out evals/results.json
 ```
 
+Without `--force` this is non-destructive at the COMMIT, not merely at a
+pre-check: the install refuses an existing destination outright, so a results
+file created by another writer while `init-results` was running is preserved
+rather than replaced. `--force` is the only path that may overwrite recorded
+evidence.
+
 Validate an existing results file against the corpus and the active local
 contract (`--contract`/`--config`/`--skill` point it at a different package):
 
 ```powershell
 py -m evals.harness validate-results --results evals/results.json
+```
+
+Judge behavioral conformance (a stricter, separate question — see
+"Schema validity vs behavioral conformance" below):
+
+```powershell
+py -m evals.harness conformance --results evals/results.json
 ```
 
 ## Result format
@@ -61,7 +74,14 @@ ID must appear exactly once:
 ```json
 {
   "state": "PASS",
-  "reason": "optional; required for SKIP"
+  "reason": "optional; required for SKIP",
+  "execution_provenance": {
+    "run_id": "2026-09-04T09-15-00Z-local",
+    "host": "opencode 1.18.23",
+    "model": "sairoute/SAIFREN",
+    "runner": "evals/run_local.py",
+    "response_digest": "3f786850e387550fdab836ed7e6dc881de23001b00000000000000000000abcd"
+  }
 }
 ```
 
@@ -69,6 +89,18 @@ ID must appear exactly once:
 - `FAIL` — a model/host run actually violated the case;
 - `SKIP` — deliberately not run, with a recorded `reason`;
 - `NOT_RUN` — not yet run.
+
+`execution_provenance` is optional for `NOT_RUN` and required by the
+`conformance` gate for every other state. When present it must contain
+exactly these five keys, each a non-empty string, and nothing else:
+
+| Key | Meaning |
+|---|---|
+| `run_id` | identifier for the eval run that produced this record |
+| `host` | the host/tool that executed the prompt |
+| `model` | the model that answered |
+| `runner` | the script or harness that drove the run |
+| `response_digest` | digest of the recorded model response |
 
 The file also records the `contract_id` it was produced under and the eval
 corpus `version`, case count, and deterministic `digest`. A results file
@@ -89,6 +121,31 @@ or foreign contract can never masquerade as current evidence.
 A JSON file containing English wishes is not a passing eval. Behavioral
 conformance is claimed only when an actual model/host run produced recorded
 results. Cases without a run stay `NOT_RUN`, never `PASS`.
+
+## Schema validity vs behavioral conformance
+
+`validate-results` and `conformance` answer different questions, and a file
+can pass the first while failing the second.
+
+`validate-results` is about SHAPE and BINDING: the document parses, every
+corpus case appears exactly once, states and reasons are well-formed, any
+`execution_provenance` present is complete, and the file is bound to this
+corpus digest and a canonical `contract_id`. It reports whether that binding
+is current, and it is satisfied by an all-`NOT_RUN` file.
+
+`conformance` is about EVIDENCE, and it exits nonzero unless all of these
+hold:
+
+- the bound `contract_id` equals the active package's;
+- no case is `FAIL` or `NOT_RUN`;
+- every `PASS` and `SKIP` record carries complete `execution_provenance`;
+- **at least one case actually `PASS`ed.**
+
+That last rule is why an all-`SKIP` corpus is `NOT CONFORMANT`. `SKIP` means
+"deliberately not run", so a corpus in which nothing ran proves nothing about
+behavior no matter how well-formed its provenance is. Mixed `PASS` + `SKIP` is
+valid: `SKIP` is for individual cases that genuinely do not apply to the run,
+not for the corpus as a whole.
 
 ## Coverage map
 

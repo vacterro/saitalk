@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
-import io
 import json
 import os
 import re
@@ -85,7 +85,14 @@ def _destination_lock(path: Path):
             fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError as exc:
         if fh is not None:
-            fh.close()
+            # R016/W2-007: the primary failure is the LOCK failure. A
+            # close() that also fails during acquisition teardown must not
+            # replace it -- contention then gets diagnosed as whatever the
+            # cleanup happened to raise.
+            try:
+                fh.close()
+            except OSError:
+                pass
         raise EvalError(f"cannot lock results destination {path}: {exc}") from exc
     try:
         yield
@@ -193,19 +200,24 @@ def export_cases(data: dict[str, Any]) -> str:
 
 
 def corpus_digest(data: dict[str, Any]) -> str:
-    """PERF-003: stream the canonical JSON straight into SHA-256.
+    """R018/PERF-003: stream the canonical JSON straight into SHA-256.
 
     The digest must remain byte-for-byte compatible with the canonical
     representation produced by ``export_cases``: ``ensure_ascii=True``,
-    ``sort_keys=True``, ``indent=2``, one final newline.  A streaming
-    hash sink avoids the whole-string + whole-bytes materialization that
-    a large corpus would otherwise incur twice.
+    ``sort_keys=True``, ``indent=2``, one final newline.
+
+    ``json.dump`` into a ``StringIO`` and then ``getvalue().encode()``
+    was the previous implementation, and it materialized the whole
+    serialization twice -- once as ``str``, once as ``bytes`` -- despite
+    the docstring claiming it did not. ``iterencode`` yields the same
+    canonical byte stream in chunks, so peak memory is a chunk rather
+    than a multiple of the corpus.
     """
     sink = hashlib.sha256()
-    with io.StringIO() as buf:
-        json.dump(data, buf, ensure_ascii=True, sort_keys=True, indent=2)
-        buf.write("\n")
-        sink.update(buf.getvalue().encode("utf-8"))
+    encoder = json.JSONEncoder(ensure_ascii=True, sort_keys=True, indent=2)
+    for chunk in encoder.iterencode(data):
+        sink.update(chunk.encode("utf-8"))
+    sink.update(b"\n")
     return sink.hexdigest()
 
 
@@ -213,8 +225,20 @@ def new_results(cases: dict[str, Any]) -> dict[str, dict[str, str]]:
     return {case["id"]: {"state": "NOT_RUN"} for case in cases["cases"]}
 
 
-def validate_results(results: Any, cases: dict[str, Any]) -> None:
-    validate_cases(cases)
+def validate_results(
+    results: Any, cases: dict[str, Any], *, cases_validated: bool = False
+) -> None:
+    """Validate a results mapping against *cases*.
+
+    R019/PERF-004: ``cases_validated=True`` means the caller already ran
+    :func:`validate_cases` on this exact corpus object, so the corpus walk
+    is skipped here. Without the flag the corpus is still fully validated,
+    because a caller that does not hold a validated snapshot must not get
+    a weaker check. The flag is keyword-only and defaults to False, so the
+    strict behaviour is what every existing caller keeps.
+    """
+    if not cases_validated:
+        validate_cases(cases)
     if not isinstance(results, dict):
         raise EvalError("results must be a JSON object")
     expected = {case["id"] for case in cases["cases"]}
@@ -269,12 +293,92 @@ def validate_results(results: Any, cases: dict[str, Any]) -> None:
                     )
 
 
+def _fsync_parent_directory(path: Path) -> None:
+    """Durably commit *path*'s directory entry after an atomic install.
+
+    R015/W2-006: a FAILED directory fsync is not swallowed. This step is what
+    makes the rename crash-durable, so reporting plain success after it failed
+    reported a guarantee that was not delivered. The new bytes ARE already
+    visible when this runs -- the install happened -- so the message says so
+    explicitly and the caller must not retry assuming nothing was committed.
+
+    Windows has no directory-fsync equivalent and never claimed one, so this
+    is a no-op there. An unopenable directory elsewhere is also not a
+    durability failure: some filesystems refuse to open a directory for
+    reading at all, which is a capability limit rather than a lost write.
+
+    The platform check lives HERE, not at the call site, so the whole step is
+    one testable unit on every host.
+    """
+    if os.name == "nt":
+        return
+    try:
+        dir_fd = os.open(str(path.parent), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError as exc:
+        raise EvalError(
+            f"commit durability uncertain for {path}: the results were "
+            f"installed and are already visible, but the directory fsync that "
+            f"makes the rename crash-durable failed: {exc}"
+        ) from exc
+    finally:
+        try:
+            os.close(dir_fd)
+        except OSError:
+            pass
+
+
+def _commit_no_clobber(tmp: Path, path: Path) -> None:
+    """Install *tmp* at *path*, FAILING if *path* already exists.
+
+    R013/W2-004: ``os.replace`` overwrites unconditionally, so
+    ``init-results`` -- documented as refusing to overwrite recorded
+    evidence without ``--force`` -- could destroy a results file created
+    after its own ``exists()`` check. The destination lock only serializes
+    cooperating harness writers; it never makes the "did not exist"
+    observation atomic with the commit.
+
+    ``os.link`` (POSIX) and ``os.rename`` (Windows) both refuse an existing
+    destination, so the filesystem itself performs the check-and-commit as
+    one operation. The staged temp file is removed by the caller's cleanup
+    on failure.
+    """
+    try:
+        if os.name == "nt":
+            os.rename(tmp, path)
+        else:
+            os.link(tmp, path)
+            tmp.unlink()
+    except FileExistsError as exc:
+        raise EvalError(
+            f"refusing to overwrite existing results at {path}: it appeared "
+            f"during this run; pass --force to replace recorded evidence"
+        ) from exc
+    except OSError as exc:
+        raise EvalError(f"cannot install results at {path}: {exc}") from exc
+
+
 def _write_results_locked(
     results: dict[str, Any],
     path: Path,
     cases: dict[str, Any],
     contract_id: str | None = None,
+    *,
+    must_not_exist: bool = False,
 ) -> None:
+    """Stage, durably commit and atomically install one results document.
+
+    *must_not_exist* is the R013/W2-004 no-clobber commit: the rename is
+    performed with ``os.link`` + ``unlink`` (POSIX) or ``os.rename``
+    (Windows), both of which FAIL when the destination already exists,
+    instead of ``os.replace``, which overwrites unconditionally. That
+    closes the check-then-replace window in which a file created between
+    ``exists()`` and the commit was destroyed by the command documented as
+    non-destructive.
+    """
     payload = {
         "version": 1,
         "schema": "saitalk-eval-results",
@@ -313,24 +417,15 @@ def _write_results_locked(
                 ) from exc
             if existing_mode is not None and os.name != "nt":
                 os.fchmod(fh.fileno(), existing_mode)
-        os.replace(tmp, path)
-        # CORE-006: durably commit the rename on POSIX so the directory
-        # entry survives a crash between replace and the next read.
-        if os.name != "nt":
-            try:
-                dir_fd = os.open(str(path.parent), os.O_RDONLY)
-            except OSError:
-                dir_fd = None
-            if dir_fd is not None:
-                try:
-                    os.fsync(dir_fd)
-                except OSError:
-                    pass
-                finally:
-                    try:
-                        os.close(dir_fd)
-                    except OSError:
-                        pass
+        if must_not_exist:
+            _commit_no_clobber(tmp, path)
+        else:
+            os.replace(tmp, path)
+        # CORE-006 / R015: durably commit the rename so the directory entry
+        # survives a crash between install and the next read. A failure there
+        # is reported, never swallowed -- see _fsync_parent_directory, which
+        # also owns the platform check.
+        _fsync_parent_directory(path)
     except BaseException:
         if fd_owned:
             try:
@@ -349,9 +444,29 @@ def write_results(
     path: Path,
     cases: dict[str, Any],
     contract_id: str | None = None,
+    *,
+    must_not_exist: bool = False,
 ) -> None:
-    validate_results(results, cases)
-    has_recorded = any(record["state"] != "NOT_RUN" for record in results.values())
+    """Validate and persist one immutable results snapshot.
+
+    R005/CORE-005: the caller's ``results`` and ``cases`` are DETACHED
+    first, and every later step -- validation, the ``has_recorded``
+    decision, the corpus digest/count/version and the serialization --
+    reads only those detached copies. Previously validation ran against
+    the caller's live objects and the writer serialized the same live
+    objects afterwards, so a mutation in between persisted bytes that had
+    never been validated (a state-only ``PASS`` with a null
+    ``contract_id``, which ``load_results`` then rejects).
+
+    ``must_not_exist=True`` is the atomic no-clobber commit used by
+    ``init-results`` (R013/W2-004).
+    """
+    snapshot_results = copy.deepcopy(results)
+    snapshot_cases = copy.deepcopy(cases)
+    validate_results(snapshot_results, snapshot_cases)
+    has_recorded = any(
+        record["state"] != "NOT_RUN" for record in snapshot_results.values()
+    )
     if contract_id is not None:
         validate_contract_id(contract_id, context="write_results")
     elif has_recorded:
@@ -359,7 +474,13 @@ def write_results(
             "recorded results (states other than NOT_RUN) must bind a contract_id"
         )
     with _destination_lock(path):
-        _write_results_locked(results, path, cases, contract_id)
+        _write_results_locked(
+            snapshot_results,
+            path,
+            snapshot_cases,
+            contract_id,
+            must_not_exist=must_not_exist,
+        )
 
 
 def load_results(
@@ -370,11 +491,12 @@ def load_results(
 ) -> dict[str, Any]:
     """Load and fully validate a results file and its provenance.
 
-    PERF-003: when *cases_validated* is True the caller already ran
-    ``validate_cases`` on the corpus; this function must not re-validate
-    it.  Otherwise validate_cases runs once here, so the corpus schema
-    is verified exactly once for the whole ``load_results`` + caller
-    pipeline.
+    R019/PERF-004: when *cases_validated* is True the caller already ran
+    ``validate_cases`` on the corpus and this function must not re-validate
+    it.  Otherwise validate_cases runs exactly once, here -- the nested
+    ``validate_results`` call is told the corpus is already validated, so
+    the corpus schema really is verified once for the whole pipeline
+    instead of twice.
     """
     try:
         data = _load_json(path)
@@ -407,7 +529,10 @@ def load_results(
     results = data.get("results")
     if not isinstance(results, dict):
         raise EvalError(f"{path}: results field must be a JSON object")
-    validate_results(results, cases)
+    # R019/PERF-004: the corpus was validated above (here or by the caller);
+    # re-validating it inside validate_results is the dead fast path this
+    # flag removes.
+    validate_results(results, cases, cases_validated=True)
     contract_id = data.get("contract_id")
     has_recorded = any(record["state"] != "NOT_RUN" for record in results.values())
     if contract_id is not None:
@@ -433,7 +558,14 @@ def evaluate_conformance(
     carries auditable execution provenance.  A bare state-only PASS record
     is rejected as insufficient behavioural evidence.
 
-    PERF-003: ``cases_validated=True`` skips the duplicate
+    R014/W2-005: conformance is NON-VACUOUS. ``SKIP`` means "deliberately
+    not run", so a corpus in which nothing passed establishes nothing about
+    behaviour no matter how well-formed its provenance is -- an all-SKIP
+    file previously returned ``conformant=True`` with ``PASS: 0``. At least
+    one real executed PASS is now required. Mixed PASS+SKIP remains valid:
+    SKIP is for genuinely inapplicable cases, not for the whole corpus.
+
+    R019/PERF-004: ``cases_validated=True`` skips the duplicate
     ``validate_cases`` call when the caller already holds a validated
     snapshot.
     """
@@ -462,6 +594,14 @@ def evaluate_conformance(
                 f"{cid}: {record['state']} without execution_provenance is "
                 "not behavioural evidence"
             )
+    # R014/W2-005: SKIP is documented as "deliberately not run", so a corpus
+    # with zero PASS records is not behavioural evidence of anything.
+    if counts["PASS"] == 0:
+        reasons.append(
+            f"no case PASSed ({counts['SKIP']} SKIP of {len(results)}); SKIP is "
+            "deliberately-not-run, so conformance needs at least one executed "
+            "PASS"
+        )
     conformant = not reasons
     return {
         "counts": counts,
@@ -564,8 +704,9 @@ def main() -> int:
             data = load_cases(cases_path)
             results = new_results(data)
             out = args.out or cases_path.with_name("results.json")
+            force = bool(getattr(args, "force", False))
             with _destination_lock(out):
-                if out.exists() and not getattr(args, "force", False):
+                if out.exists() and not force:
                     try:
                         existing = load_results(out, data, cases_validated=True)
                     except (EvalError, OSError, json.JSONDecodeError):
@@ -589,7 +730,11 @@ def main() -> int:
                         f"init-results: refusing to overwrite existing results file "
                         f"{out}; use --force to reset recorded evidence"
                     )
-                _write_results_locked(results, out, data)
+                # R013/W2-004: the check above is a good diagnostic, not the
+                # guarantee. Without --force the COMMIT itself refuses an
+                # existing destination, so a file created between that check
+                # and this line survives instead of being replaced.
+                _write_results_locked(results, out, data, must_not_exist=not force)
             print(f"EVALS RESULTS: {out} ({len(results)} cases NOT_RUN)")
             return 0
         if args.command == "validate-results":

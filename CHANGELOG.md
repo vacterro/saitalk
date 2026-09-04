@@ -21,6 +21,60 @@ conformance gate that requires runner-backed execution provenance
 (CORE-003). v0.1.10 remains tagged at 2c2294d8; this release advances the
 working tree to a new identity.
 
+A second external audit (`audit/1.md`, receipt SRC-001) then reproduced 20
+findings against this same tree, including four cases where the paragraph above
+described a guarantee the code did not yet deliver. 0.1.11 is still untagged, so
+those repairs land in this entry rather than a new version:
+
+- the live-source lexer keeps every code-span offset in ONE coordinate system.
+  Rebasing spans after a same-line comment close made a literal `<!--` inside a
+  later inline code span read as a comment opener — hiding the headings and
+  state fields that followed — and re-scanned a shorter suffix per comment,
+  which was quadratic in line length (CORE-001 / PERF-001);
+- `refresh` really does keep cancellation identity: `KeyboardInterrupt` and
+  `SystemExit` propagate unchanged instead of being reclassified as
+  `SaitalkError` (W2-001);
+- `validate_package` validates the bytes it captured. One capture now produces
+  the `contract_id`, the structural verdict and the phase-3 baseline, so an
+  A→B→A mutation can no longer return an ID for a package that is not there
+  (W2-002); phase 3 also re-asserts LOGICAL manifest stability (CORE-002) and
+  re-checks bound-state freshness before returning (CORE-003);
+- bound-state freshness is decided by CONTENT. Same-inode, same-length rewrites
+  with restored timestamps previously passed a metadata-only check (W2-003);
+- state-file I/O errors are normalized, so a missing or unreadable `--state`
+  argument produces one `SAITALK FAIL:` line instead of a traceback (CORE-004);
+- `write_results` detaches `results` and `cases` before validating, and
+  serializes only those snapshots, so it can never persist an unvalidated
+  object state (CORE-005);
+- `init-results` is non-destructive at the COMMIT: without `--force` the
+  install itself refuses an existing destination, closing the
+  check-then-replace window (W2-004);
+- behavioral conformance is non-vacuous — an all-`SKIP` corpus is NOT
+  CONFORMANT, because `SKIP` means deliberately not run (W2-005);
+- a failed post-install directory fsync is reported as uncertain durability
+  rather than silently swallowed (W2-006), and a failing `close()` during lock
+  acquisition no longer masks the lock error (W2-007);
+- adapter traversal yields GLOBAL lexical order, so the reported first invalid
+  adapter no longer depends on directory depth, and a wide directory is no
+  longer materialized as `Path` objects before the first yield (W2-008 /
+  PERF-002);
+- `corpus_digest` streams `iterencode` chunks into SHA-256 instead of building
+  a whole-serialization `str` plus a whole-serialization `bytes`; every existing
+  digest is unchanged (PERF-003);
+- `cases_validated` is a real fast path: it is threaded into
+  `validate_results`, which previously re-validated the corpus regardless
+  (PERF-004);
+- `evals/README.md` documents the `conformance` command, the exact
+  `execution_provenance` object, and how schema validity differs from
+  behavioral conformance (CORE-008).
+
+Every one of those repairs carries a regression in
+`AuditSrc001RegressionTests`, each proven able to fail by reverting the repair
+and observing the red. Two inherited tests were renamed because their names
+claimed more than they checked: `test_destination_lock_preserves_lock_failure_
+over_close` only ever injected a lock-primitive failure, and
+`test_corpus_digest_streams_deterministic` never measured memory.
+
 ## 0.1.10 - 2026-08-26
 
 Audit-driven repair release. Every item below has a red control in the test

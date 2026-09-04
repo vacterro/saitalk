@@ -315,10 +315,29 @@ def _strip_html_comments_preserving_spans(
     characters the caller would have obtained from a naive elision, but
     code-span content is preserved verbatim, so a backtick-opener carrying
     a backtick inside its info string is still recognised as text.
+
+    R001/PERF-001: the code spans are scanned ONCE, in absolute
+    coordinates over the whole original line, and consumed by a single
+    monotonically advancing index.  Rebasing spans onto ``line[cursor:]``
+    after every same-line comment close made every later offset
+    comparison mix two coordinate systems -- a literal ``<!--`` inside an
+    inline code span was then read as a real comment opener, hiding the
+    live headings and state fields that followed -- and re-scanned a
+    shorter suffix per comment, which is quadratic in line length.
     """
+    # Bytes still inside a carried-over comment are comment content, not
+    # inline text, so span discovery starts after that comment closes.
+    # The offsets are rebased to absolute ONCE, here, and never again.
+    scan_base = 0
+    if in_comment:
+        close = line.find(_HTML_COMMENT_CLOSE)
+        scan_base = len(line) if close == -1 else close + len(_HTML_COMMENT_CLOSE)
+    spans = [
+        (start + scan_base, end + scan_base)
+        for start, end in _scan_code_spans(line[scan_base:])
+    ]
     out: list[str] = []
     cursor = 0
-    spans = _scan_code_spans(line) if not in_comment else []
     span_idx = 0
     while cursor < len(line):
         if in_comment:
@@ -328,47 +347,29 @@ def _strip_html_comments_preserving_spans(
                 break
             cursor = close + len(_HTML_COMMENT_CLOSE)
             in_comment = False
-            spans = _scan_code_spans(line[cursor:])
-            span_idx = 0
             continue
-        # advance span_idx to the first span whose end > cursor
+        # Advance the span cursor to the first span that can still cover
+        # `cursor`; spans are sorted and non-overlapping, so this index
+        # only ever moves forward across the whole line.
         while span_idx < len(spans) and spans[span_idx][1] <= cursor:
             span_idx += 1
-        in_span = (
-            span_idx < len(spans)
-            and spans[span_idx][0] <= cursor < spans[span_idx][1]
-        )
-        if in_span:
-            out.append(line[cursor])
-            cursor += 1
+        if span_idx < len(spans) and spans[span_idx][0] <= cursor:
+            # Inside a code span: copy it out verbatim, delimiters and all.
+            span_end = spans[span_idx][1]
+            out.append(line[cursor:span_end])
+            cursor = span_end
             continue
-        # find the next comment-open or code-span boundary from cursor
+        # Live text: it runs until the next comment opener, and any opener
+        # inside the upcoming code span is literal text, not a delimiter.
+        next_span_start = spans[span_idx][0] if span_idx < len(spans) else len(line)
         next_open = line.find(_HTML_COMMENT_OPEN, cursor)
-        if next_open == -1:
-            out.append(line[cursor:])
-            cursor = len(line)
-            break
-        # if the opener falls inside a code span, treat it as literal text
-        opener_in_span = False
-        for start, end in spans:
-            if start <= next_open < end:
-                opener_in_span = True
-                # rewrite spans relative to out
-                break
-        if opener_in_span:
-            out.append(line[cursor:next_open + len(_HTML_COMMENT_OPEN)])
-            cursor = next_open + len(_HTML_COMMENT_OPEN)
+        if next_open == -1 or next_open >= next_span_start:
+            out.append(line[cursor:next_span_start])
+            cursor = next_span_start
             continue
         out.append(line[cursor:next_open])
         cursor = next_open + len(_HTML_COMMENT_OPEN)
-        close = line.find(_HTML_COMMENT_CLOSE, cursor)
-        if close == -1:
-            in_comment = True
-            cursor = len(line)
-            break
-        cursor = close + len(_HTML_COMMENT_CLOSE)
-        spans = _scan_code_spans(line[cursor:])
-        span_idx = 0
+        in_comment = True
     return "".join(out), in_comment
 
 
@@ -398,8 +399,8 @@ def _fence_opener_span(line: str, closing: bool = False) -> tuple[int, int, str]
     if its info string contains a backtick (CommonMark: a backtick run
     that opens a code span cannot simultaneously close a fence).  A
     *closing* fence (the second argument) must carry no info string
-    except whitespace; ``\`\`\` extra text`` does not close a fence
-    (CommonMark).
+    except whitespace; a backtick run followed by ``extra text`` does not
+    close a fence (CommonMark).
     """
     leading, cursor = _leading_columns(line)
     if leading > 3 or cursor >= len(line):
@@ -777,6 +778,16 @@ def _safe_write_temp(target: Path, data: bytes, mode: int | None = None) -> Path
     operation context, so the public ``refresh``/CLI error contract stays
     uniform instead of leaking a raw ``OSError`` traceback.  The descriptor is
     closed on any failure that happens before ``os.fdopen`` takes ownership.
+
+    R010/W2-001: process-control exceptions are NOT normalized.  Cleanup
+    runs identically for them, but ``KeyboardInterrupt``, ``SystemExit`` and
+    any other non-``Exception`` ``BaseException`` are re-raised unchanged,
+    so Ctrl+C during staging stays a cancellation instead of being
+    reclassified as an ordinary refresh error.  ``refresh``'s rollback
+    handler catches ``BaseException`` precisely so it can roll back and then
+    let the original cancellation propagate; converting the type here
+    destroyed that and broke the documented cancellation-identity
+    guarantee.
     """
     dir_path = target.parent
     prefix = f"{target.name}."
@@ -804,6 +815,8 @@ def _safe_write_temp(target: Path, data: bytes, mode: int | None = None) -> Path
             os.unlink(tmp_path)
         except OSError:
             pass
+        if not isinstance(exc, Exception):
+            raise
         raise SaitalkError(f"staging failure for {target}: {exc}") from exc
     return Path(tmp_path)
 
@@ -1015,6 +1028,20 @@ def _read_resolved_manifest(resolved: dict[str, Path]) -> dict[str, str]:
     return manifest
 
 
+def _decode_manifest_bytes(label: str, blob: bytes) -> str:
+    """Decode one captured manifest member exactly as :func:`read_text` would.
+
+    R011/W2-002: ``validate_package`` captures manifest BYTES under its
+    phase-1 lock and must validate those bytes rather than re-reading the
+    paths, so the returned ``contract_id`` and the phase-3 stability
+    baseline always come from one snapshot.
+    """
+    try:
+        return blob.decode("utf-8").removeprefix("\ufeff")
+    except UnicodeDecodeError as exc:
+        raise SaitalkError(f"not UTF-8: {label}") from exc
+
+
 # ---------------------------------------------------------------------------
 # validate (CORE-005 / W2-002: coherent snapshot)
 # ---------------------------------------------------------------------------
@@ -1024,7 +1051,18 @@ def _validate(resolved: dict[str, Path]) -> tuple[str, dict[str, str]]:
 
     Caller must hold the locks for *resolved*.
     """
-    manifest = _read_resolved_manifest(resolved)
+    return _validate_manifest(_read_resolved_manifest(resolved))
+
+
+def _validate_manifest(manifest: dict[str, str]) -> tuple[str, dict[str, str]]:
+    """Validate one already-captured manifest text snapshot (R011/W2-002).
+
+    This is the only place the contract/config/structure verdict is
+    computed, so the ID returned to a caller always belongs to the exact
+    text that produced it.  ``_validate`` above is the read-then-validate
+    convenience wrapper; ``validate_package`` passes its phase-1 capture
+    directly.
+    """
     config = parse_conf(manifest["saitalk.conf"])
     check_structure(manifest["SAITALK.md"], manifest["SKILL.md"])
 
@@ -1068,7 +1106,7 @@ def voice_command(message: str) -> str | None:
 
 
 def validate_state(path: Path, expected: str) -> None:
-    validate_state_bytes(path.read_bytes(), expected)
+    validate_state_bytes(read_bytes(path), expected)
 
 
 def validate_state_bytes(blob: bytes, expected: str) -> None:
@@ -1162,50 +1200,99 @@ def resolve_artifact_language(
 # ---------------------------------------------------------------------------
 # _drift_normalize is defined at module level for precompilation.
 
-def _iter_md_files(transport_dir: Path):
-    """Yield Markdown adapters iteratively, following directories safely.
+def _sorted_dir_entries(directory: Path) -> list[tuple[str, str, bool, bool]]:
+    """Return one directory's entries as ``(sort_key, name, is_dir, is_file)``,
+    sorted.
 
-    PERF-001: a generator instead of a fully populated list.  Cycle
-    detection uses (st_dev, st_ino) from stat() instead of Path.resolve(),
-    avoiding O(n*d) resolve work in deep trees.  Directory classification
-    uses ``entry.is_dir()`` (follows symlinks) so symlinked directories
-    are traversed correctly.  Adapters are yielded in deterministic
-    lexical order so a lexically-first invalid file is seen first.
+    ``os.scandir`` is used so file/directory classification comes from the
+    cached ``DirEntry`` instead of a fresh ``os.stat`` per entry, and only
+    the names are retained rather than ``Path`` objects.
+
+    The sort key appends ``/`` to directory names so the order matches
+    lexical order of the RELATIVE PATHS the caller will report: ``z.md``
+    precedes ``z/a.md`` because ``.`` sorts before ``/``, while a plain
+    name sort would put the directory first.
     """
-    seen: set[tuple[int, int]] = set()
+    try:
+        with os.scandir(directory) as scan:
+            entries = []
+            for entry in scan:
+                is_dir = entry.is_dir()
+                entries.append(
+                    (
+                        entry.name + "/" if is_dir else entry.name,
+                        entry.name,
+                        is_dir,
+                        False if is_dir else entry.is_file(),
+                    )
+                )
+    except OSError as exc:
+        raise SaitalkError(f"cannot inspect adapter directory {directory}: {exc}") from exc
+    entries.sort(key=lambda item: item[0])
+    return entries
+
+
+def _iter_md_files(transport_dir: Path):
+    """Yield Markdown adapters in GLOBAL lexical path order, following
+    directories safely.
+
+    R017/W2-008/PERF-002: the ordering contract is now the one the callers
+    actually rely on. The previous traversal yielded a directory's own
+    files before descending, so ``adapters/z.md`` was reported before
+    ``adapters/a/a.md`` even though the latter is lexically first, and
+    ``validate_drift``'s fail-fast diagnostic depended on tree depth.
+    Directories and files are merged into ONE ordering, so the file
+    reported first is the lexically first one in the whole tree.
+
+    Memory, stated honestly: global lexical order cannot be produced
+    without knowing all of a directory's sibling NAMES, so one directory's
+    entry names are held at a time (``os.scandir``, cached
+    classification, a single sort, no ``Path`` objects). What is never
+    materialized is the tree: at most one sorted name list per level of
+    depth is live, and a lexically first invalid adapter stops the walk
+    before any later directory is opened.
+
+    Cycle detection uses ``(st_dev, st_ino)`` rather than
+    ``Path.resolve()``, and symlinked directories are traversed.
+    """
     try:
         root_stat = os.stat(transport_dir, follow_symlinks=True)
-        seen.add((root_stat.st_dev, root_stat.st_ino))
     except OSError as exc:
         raise SaitalkError(f"cannot stat adapter path {transport_dir}: {exc}") from exc
-    pending: list[Path] = [transport_dir]
-    # Deterministic order across the whole tree: collect each directory's
-    # matches and subdirectories, then yield matches sorted by path before
-    # descending.  This lets ``validate_drift`` fail fast on the lexically
-    # first invalid adapter without enumerating the remainder.
-    while pending:
-        directory = pending.pop()
-        try:
-            entries = sorted(directory.iterdir(), key=lambda entry: str(entry))
-        except OSError as exc:
-            raise SaitalkError(f"cannot inspect adapter directory {directory}: {exc}") from exc
-        files: list[Path] = []
-        directories: list[Path] = []
-        for entry in entries:
-            try:
-                if entry.is_dir():
-                    target_stat = os.stat(entry, follow_symlinks=True)
-                    entry_id = (target_stat.st_dev, target_stat.st_ino)
-                    if entry_id not in seen:
-                        seen.add(entry_id)
-                        directories.append(entry)
-                elif entry.is_file() and entry.name.casefold().endswith(".md"):
-                    files.append(entry)
-            except OSError as exc:
-                raise SaitalkError(f"cannot classify adapter path {entry}: {exc}") from exc
-        for path in sorted(files, key=lambda p: str(p)):
-            yield path
-        pending.extend(reversed(directories))
+    seen: set[tuple[int, int]] = {(root_stat.st_dev, root_stat.st_ino)}
+
+    # Each stack frame is one directory's remaining sorted entries, so the
+    # walk descends as soon as a directory sorts next -- it never has to
+    # finish a level first.
+    stack: list[tuple[Path, list[tuple[str, str, bool, bool]], int]] = [
+        (transport_dir, _sorted_dir_entries(transport_dir), 0)
+    ]
+    while stack:
+        directory, entries, index = stack.pop()
+        while index < len(entries):
+            _key, name, is_dir, is_file = entries[index]
+            index += 1
+            entry_path = directory / name
+            if is_dir:
+                try:
+                    target_stat = os.stat(entry_path, follow_symlinks=True)
+                except OSError as exc:
+                    raise SaitalkError(
+                        f"cannot classify adapter path {entry_path}: {exc}"
+                    ) from exc
+                entry_id = (target_stat.st_dev, target_stat.st_ino)
+                if entry_id in seen:
+                    continue
+                seen.add(entry_id)
+                stack.append((directory, entries, index))
+                directory, entries, index = (
+                    entry_path,
+                    _sorted_dir_entries(entry_path),
+                    0,
+                )
+                continue
+            if is_file and name.casefold().endswith(".md"):
+                yield entry_path
 
 
 def _raise_drift(path: Path, root: Path, line_no: int, normalized_text: str) -> None:
@@ -1290,26 +1377,68 @@ def validate_drift(root: Path) -> None:
 # W2-003 / CORE-004: validate_package
 # ---------------------------------------------------------------------------
 
+def _stat_state(state_path: Path) -> os.stat_result:
+    """``os.stat`` for a bound state file with normalized errors (R004).
+
+    Raw ``FileNotFoundError``/``PermissionError``/``OSError`` from here
+    reached ``main()``, which only catches :class:`SaitalkError`, so a
+    missing or unreadable ``--state`` argument crashed the public CLI
+    with a traceback instead of one ``SAITALK FAIL:`` line.
+    """
+    try:
+        return os.stat(state_path, follow_symlinks=True)
+    except FileNotFoundError as exc:
+        raise SaitalkError(f"missing state file: {state_path}") from exc
+    except PermissionError as exc:
+        raise SaitalkError(f"permission denied: {state_path}") from exc
+    except OSError as exc:
+        raise SaitalkError(f"cannot stat state file {state_path}: {exc}") from exc
+
+
 def _capture_state_snapshot(state_path: Path) -> tuple[Path, bytes, tuple[int, int, int], float]:
     """Capture the logical path, file identity and bytes for *state_path*.
 
     Returns ``(path, bytes, stat_identity, mtime)`` where ``stat_identity``
     is ``(st_dev, st_ino, st_size)`` and ``mtime`` is the file's last
-    modification time.  A later re-stat that disagrees is the W2-003
-    "state changed during validation" signal.
+    modification time.  A later disagreement is the W2-003 "state changed
+    during validation" signal; the bytes are what decide it (R012), the
+    metadata only sharpens the diagnostic.
+
+    R004: every filesystem failure here is normalized into
+    :class:`SaitalkError`, because this is the first thing the CLI touches
+    for a user-supplied ``--state`` path.
     """
-    stat = os.stat(state_path, follow_symlinks=True)
+    stat = _stat_state(state_path)
     return (
         state_path,
-        state_path.read_bytes(),
+        read_bytes(state_path),
         (stat.st_dev, stat.st_ino, stat.st_size),
         stat.st_mtime,
     )
 
 
 def _state_snapshot_unchanged(snapshot) -> bool:
-    path, _bytes, identity, mtime = snapshot
-    current = os.stat(path, follow_symlinks=True)
+    """Is the bound state still byte-identical to its captured snapshot?
+
+    R012/W2-003: the comparison is CONTENT-first. Metadata alone was
+    defeatable -- rewriting the same inode in place with a same-length
+    payload and restoring ``st_mtime`` via ``os.utime(..., ns=...)`` left
+    ``(st_dev, st_ino, st_size, st_mtime)`` identical, so an already
+    invalid state certified as fresh. Timestamps are evidence about a
+    file, never proof about its bytes.
+
+    A state file that disappeared or became unreadable mid-validation is
+    "changed", not an error: the caller turns this into the canonical
+    ``state changed during validation`` refusal.
+    """
+    path, captured, identity, mtime = snapshot
+    try:
+        current = os.stat(path, follow_symlinks=True)
+        current_bytes = path.read_bytes()
+    except OSError:
+        return False
+    if current_bytes != captured:
+        return False
     return (
         (current.st_dev, current.st_ino, current.st_size) == identity
         and current.st_mtime == mtime
@@ -1356,24 +1485,47 @@ def validate_package(
     manifest-lock scope (CORE-005 / W2-001 / W2-002 / W2-003 / PERF-002).
 
     Phase 1 acquires manifest locks, reads the three manifest members
-    exactly once, validates the contract/config/structure, and captures
-    the optional state file's bytes and stat identity.  The manifest
-    locks are then released so phase 2's drift scan does not block
-    concurrent refresh/print-id on the manifest.  Phase 3 re-acquires
-    the manifest locks and proves the manifest referents and bytes are
-    still identical to the Phase-1 capture before returning PASS.
+    exactly once, validates THOSE CAPTURED BYTES, and captures the
+    optional state file's bytes and stat identity.  The manifest locks are
+    then released so phase 2's drift scan does not block concurrent
+    refresh/print-id on the manifest.  Phase 3 re-acquires the manifest
+    locks and proves the manifest bytes, the logical referents and the
+    bound state are all still identical to the phase-1 capture before
+    returning PASS.
+
+    R011/W2-002: phase 1 previously captured bytes and then let
+    ``_validate`` re-read the same paths, so an A->B->A mutation between
+    the two reads returned B's ``contract_id`` for a package that phase 3
+    then confirmed was A.  One capture, one verdict.
+
+    R002/CORE-002: phase 3 re-asserts LOGICAL manifest stability, not only
+    physical byte equality.  Retargeting the manifest symlinks during the
+    unlocked phase 2 otherwise left the abandoned physical files
+    byte-stable and returned a PASS naming a package the caller no longer
+    points at.
+
+    R003/CORE-003: the bound state's freshness is re-checked inside phase
+    3, after the manifest checks and immediately before the successful
+    return, so a mutation during phase 3's own I/O cannot slip through.
     """
     resolved = _resolved_manifest_map(contract_path, conf_path, skill_path)
     logical_root = _require_coherent_root(contract_path, conf_path, skill_path)
+    logical = (contract_path, conf_path, skill_path)
     canonical_targets = sorted(resolved.values(), key=lambda p: str(p.resolve()))
     manifest_bytes: dict[str, bytes] = {}
 
-    # Phase 1: manifest snapshot under lock.
+    # Phase 1: manifest snapshot under lock -- capture, then validate the
+    # capture itself. No second read of the paths.
     locks1 = _acquire_locks(canonical_targets)
     try:
         for label, path in resolved.items():
             manifest_bytes[label] = read_bytes(path)
-        contract_id, config = _validate(resolved)
+        contract_id, config = _validate_manifest(
+            {
+                label: _decode_manifest_bytes(label, blob)
+                for label, blob in manifest_bytes.items()
+            }
+        )
         state_snapshot = None
         if state_path is not None:
             state_snapshot = _capture_state_snapshot(state_path)
@@ -1400,6 +1552,12 @@ def validate_package(
                     f"manifest member {label} changed during validation; "
                     "aborting to avoid a stale result"
                 )
+        _assert_manifest_stable(logical, resolved)
+        if state_snapshot is not None and not _state_snapshot_unchanged(state_snapshot):
+            raise SaitalkError(
+                "state changed during validation: "
+                f"{state_path} identity diverged; re-run validate"
+            )
         return contract_id, config
     finally:
         _release_locks(locks2)
