@@ -4215,6 +4215,161 @@ class AuditSrc001RegressionTests(unittest.TestCase):
             capture.assert_called_once_with(out)
             self.assertEqual(events, ["apply:640", "install"])
 
+    # ---- T-912: absent vs unresolvable adapters/ -----------------------
+
+    def test_drift_treats_absent_adapters_as_nothing_to_scan(self) -> None:
+        # Stated contract, not an accident: adapters are transport and
+        # non-normative, so a package need not ship any. The scan must also
+        # not be entered, or a later change could make "absent" mean
+        # "scanned and clean".
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            with unittest.mock.patch.object(
+                saitalk,
+                "_iter_md_files",
+                side_effect=AssertionError("scanned a tree that is not there"),
+            ):
+                saitalk.validate_drift(root)
+
+    def test_drift_scans_when_adapters_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            adapters = root / "adapters"
+            adapters.mkdir()
+            (adapters / "a.md").write_text("# fine\n", encoding="utf-8")
+            real = saitalk._iter_md_files
+            calls: list[int] = []
+            with unittest.mock.patch.object(
+                saitalk,
+                "_iter_md_files",
+                side_effect=lambda d: (calls.append(1), real(d))[1],
+            ):
+                saitalk.validate_drift(root)
+            self.assertEqual(len(calls), 1)
+
+    def test_drift_accepts_an_empty_adapters_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "adapters").mkdir()
+            saitalk.validate_drift(root)
+
+    def test_drift_refuses_a_dangling_adapters_symlink(self) -> None:
+        # The entry EXISTS, so something intended adapters to be there.
+        # Treating it as nothing to scan disabled the whole gate silently.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            link = root / "adapters"
+            self._symlink_or_skip(root / "nowhere", link)
+            self.assertTrue(link.is_symlink())
+            self.assertFalse(link.exists())
+            with self.assertRaises(saitalk.SaitalkError) as ctx:
+                saitalk.validate_drift(root)
+            self.assertIn("does not resolve", str(ctx.exception))
+
+    def test_drift_still_refuses_a_file_named_adapters(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "adapters").write_text("x", encoding="utf-8")
+            with self.assertRaises(saitalk.SaitalkError) as ctx:
+                saitalk.validate_drift(root)
+            self.assertIn("not a directory", str(ctx.exception))
+
+    def test_drift_reports_an_unreadable_adapters_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "adapters").mkdir()
+            with unittest.mock.patch.object(
+                saitalk.os, "lstat", side_effect=OSError("permission denied")
+            ):
+                with self.assertRaises(saitalk.SaitalkError) as ctx:
+                    saitalk.validate_drift(root)
+            self.assertIn("cannot inspect adapter path", str(ctx.exception))
+
+    # ---- T-913: cancellation keeps its identity during lock teardown ----
+
+    def _lock_teardown(self, close_exc: BaseException) -> BaseException:
+        """Contend on the lock for `target` while close() raises close_exc.
+
+        Returns whatever propagated out of _acquire_lock.
+        """
+        import hashlib as _hashlib
+
+        with tempfile.TemporaryDirectory() as temp:
+            target = Path(temp) / "SAITALK.md"
+            target.write_text("x", encoding="utf-8")
+            digest = _hashlib.sha256(
+                str(target.resolve()).encode("utf-8")
+            ).hexdigest()[:16]
+            lock_path = Path(tempfile.gettempdir()) / f"saitalk-{digest}.lock"
+            self.addCleanup(lambda: lock_path.unlink(missing_ok=True))
+            leak = []
+
+            class FailingClose:
+                def __init__(self, real):
+                    self._real = real
+
+                def fileno(self):
+                    return self._real.fileno()
+
+                def write(self, *args):
+                    return self._real.write(*args)
+
+                def close(self):
+                    leak.append(self._real)
+                    raise close_exc
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, exc_type, exc, tb):
+                    return False
+
+            real_open = Path.open
+
+            def open_lock_failing(self, *args, **kwargs):
+                handle = real_open(self, *args, **kwargs)
+                if self == lock_path:
+                    return FailingClose(handle)
+                return handle
+
+            if os.name == "nt":
+                import msvcrt
+
+                module, attr = msvcrt, "locking"
+            else:
+                import fcntl
+
+                module, attr = fcntl, "flock"
+
+            with unittest.mock.patch.object(Path, "open", open_lock_failing):
+                with unittest.mock.patch.object(
+                    module, attr, side_effect=OSError("simulated contention")
+                ):
+                    try:
+                        saitalk._acquire_lock(target)
+                    except BaseException as exc:
+                        # FailingClose.close raises before closing the real
+                        # handle; close it here so Windows allows the unlink.
+                        for fh in leak:
+                            try:
+                                fh.close()
+                            except OSError:
+                                pass
+                        return exc
+            raise AssertionError("_acquire_lock succeeded against a contended lock")
+
+    def test_lock_teardown_preserves_cancellation(self) -> None:
+        for exc_type in (KeyboardInterrupt, SystemExit):
+            with self.subTest(exception=exc_type.__name__):
+                exc = self._lock_teardown(exc_type("cancel"))
+                self.assertIsInstance(exc, exc_type)
+
+    def test_lock_teardown_still_swallows_oserror(self) -> None:
+        exc = self._lock_teardown(OSError("simulated close failure"))
+        self.assertIsInstance(exc, saitalk.SaitalkError)
+        self.assertIn("lock contention", str(exc))
+        self.assertNotIn("simulated close failure", str(exc))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -559,6 +559,17 @@ def _validate_resolved_manifest(resolved: dict[str, Path]) -> None:
             if a == b or os.path.samefile(a, b):
                 raise SaitalkError("manifest members alias the same file")
         except FileNotFoundError:
+            # T-914: NOT an oversight, and deliberately not raised here. This
+            # runs before any member has been read, so a missing member is the
+            # common case and `samefile` is simply unable to answer. Reporting
+            # it here would replace the specific, actionable diagnostic the
+            # subsequent read produces -- `missing file: <path>`, naming the
+            # member -- with a vague "cannot compare manifest paths", which is
+            # exactly the error a caller cannot act on. Two CLI regressions pin
+            # that wording (CliTests.test_missing_file_exit_one_no_traceback and
+            # ConfigTests.test_missing_file_fails), so this branch is covered by
+            # the outcome it protects rather than by a test of its own. A
+            # genuine comparison error still raises via the OSError branch.
             pass
         except OSError as exc:
             raise SaitalkError(f"cannot compare manifest paths: {exc}") from exc
@@ -697,10 +708,15 @@ def _acquire_lock(target: Path):
         else:
             fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError as exc:
-        # W2-005: a follow-up close failure must not mask the lock error.
+        # T-913: a follow-up close failure must not mask the lock error.
+        # This is the same cleanup policy _release_lock documents below:
+        # swallow OSError only, so a non-OSError cancellation during cleanup
+        # (KeyboardInterrupt, SystemExit) still propagates instead of being
+        # reclassified as lock contention. `except BaseException: pass` here
+        # previously ate a cancellation and reported contention.
         try:
             fh.close()
-        except BaseException:
+        except OSError:
             pass
         raise SaitalkError(
             f"lock contention on {target}: another refresh is in progress"
@@ -1330,12 +1346,35 @@ def validate_drift(root: Path) -> None:
     universal newline handling, and normalized in place.  No whole-file
     ``read_text`` + ``splitlines`` materialization.  Cross-line tokens are
     caught by retaining only the previous normalized line.
+
+    **An absent ``adapters/`` is nothing to scan, and that is a stated
+    contract, not an oversight**: adapters are transport and non-normative
+    (``SKILL.md``, ``references/INTERPRETATION.md``), so a package need not
+    ship any and no document requires the directory.
+
+    T-912: a ``adapters`` entry that EXISTS but does not resolve to a
+    directory is the opposite case, and it is a refusal. ``stat()`` follows
+    symlinks, so a dangling ``adapters`` symlink previously raised
+    ``FileNotFoundError`` and took the nothing-to-scan path -- something
+    clearly intended adapters to be there, and the entire drift gate went
+    silently dead. ``lstat`` answers "does the NAME exist" without following,
+    which is what separates the two cases.
     """
     transport_dir = root / "adapters"
     try:
-        transport_mode = transport_dir.stat().st_mode
+        os.lstat(transport_dir)
     except FileNotFoundError:
+        # No such entry at all: legitimately nothing to scan.
         return
+    except OSError as exc:
+        raise SaitalkError(f"cannot inspect adapter path {transport_dir}: {exc}") from exc
+    try:
+        transport_mode = transport_dir.stat().st_mode
+    except FileNotFoundError as exc:
+        raise SaitalkError(
+            f"adapter path exists but does not resolve: {transport_dir}; "
+            "a dangling adapters link disables the drift scan"
+        ) from exc
     except OSError as exc:
         raise SaitalkError(f"cannot inspect adapter path {transport_dir}: {exc}") from exc
     if not stat.S_ISDIR(transport_mode):
