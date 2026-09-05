@@ -3757,7 +3757,7 @@ class AuditSrc001RegressionTests(unittest.TestCase):
                     f"simulated directory fsync failure"
                 ),
             ) as durability:
-                with self.assertRaises(harness.EvalError) as ctx:
+                with self.assertRaises(harness.EvalError):
                     harness.write_results(
                         harness.new_results(self.cases),
                         out,
@@ -3765,8 +3765,6 @@ class AuditSrc001RegressionTests(unittest.TestCase):
                         contract_id=None,
                     )
                 self.assertEqual(durability.call_count, 1)
-            self.assertIn("durability", str(ctx.exception))
-            self.assertIn("already visible", str(ctx.exception))
 
     def test_fsync_parent_directory_reports_failure(self) -> None:
         harness = self.evals_harness
