@@ -28,7 +28,12 @@ EXECUTION_PROVENANCE_KEYS = frozenset(
     {"run_id", "host", "model", "runner", "response_digest"}
 )
 CORPUS_ROOT_KEYS = frozenset({"version", "cases"})
-RESULTS_ROOT_KEYS = frozenset({"version", "schema", "contract_id", "corpus", "results", "run"})
+RESULTS_ROOT_KEYS = frozenset({"version", "schema", "contract_id", "corpus", "results"})
+# PERF-003 (SRC-002:R010): detailed conformance-failure diagnostics are
+# bounded to this many case-specific reasons; everything past it is one
+# deterministic summary line plus exact counts. The shipped 25-case corpus
+# sits far below the cap, so its diagnostics are unchanged.
+REASON_DETAIL_CAP = 75
 RESULTS_CORPUS_KEYS = frozenset({"version", "cases", "digest"})
 CONTRACT_ID_RE = re.compile(r"^saitalk-[0-9a-f]{16}$")
 
@@ -334,20 +339,28 @@ def _fsync_parent_directory(path: Path) -> None:
     visible when this runs -- the install happened -- so the message says so
     explicitly and the caller must not retry assuming nothing was committed.
 
-    Windows has no directory-fsync equivalent and never claimed one, so this
-    is a no-op there. An unopenable directory elsewhere is also not a
-    durability failure: some filesystems refuse to open a directory for
-    reading at all, which is a capability limit rather than a lost write.
+    CORE-003 (SRC-002:R003): the same holds when the parent directory cannot
+    be OPENED on POSIX. The previous contract called that a capability limit,
+    but the caller cannot tell "this filesystem never supports directory
+    fsync" from "this one does and the attempt failed" -- both reached the
+    caller as silent success, so a crash could invalidate the installed name
+    after a reported success. An unopenable directory is now the same
+    durability-uncertain error with the same already-visible semantics.
 
-    The platform check lives HERE, not at the call site, so the whole step is
-    one testable unit on every host.
+    Windows has no directory-fsync equivalent and never claimed one, so this
+    is a no-op there. The platform check lives HERE, not at the call site, so
+    the whole step is one testable unit on every host.
     """
     if os.name == "nt":
         return
     try:
         dir_fd = os.open(str(path.parent), os.O_RDONLY)
-    except OSError:
-        return
+    except OSError as exc:
+        raise EvalError(
+            f"commit durability uncertain for {path}: the results were "
+            f"installed and are already visible, but the directory fsync that "
+            f"makes the rename crash-durable could not be attempted: {exc}"
+        ) from exc
     try:
         os.fsync(dir_fd)
     except OSError as exc:
@@ -377,13 +390,20 @@ def _commit_no_clobber(tmp: Path, path: Path) -> None:
     destination, so the filesystem itself performs the check-and-commit as
     one operation. The staged temp file is removed by the caller's cleanup
     on failure.
+
+    W2-003 (SRC-002:R006): a successful ``os.link`` is the point the
+    destination becomes installed and visible, even though the staging name
+    still exists. A staging ``unlink`` failure after that point is a
+    POST-INSTALL CLEANUP failure -- reported as installed-and-visible with
+    no-retry guidance -- never as an installation failure, and the caller
+    still runs the parent-directory durability step for the namespace state
+    that actually exists.
     """
     try:
         if os.name == "nt":
             os.rename(tmp, path)
         else:
             os.link(tmp, path)
-            tmp.unlink()
     except FileExistsError as exc:
         raise EvalError(
             f"refusing to overwrite existing results at {path}: it appeared "
@@ -391,6 +411,16 @@ def _commit_no_clobber(tmp: Path, path: Path) -> None:
         ) from exc
     except OSError as exc:
         raise EvalError(f"cannot install results at {path}: {exc}") from exc
+    if os.name == "nt":
+        return
+    try:
+        tmp.unlink()
+    except OSError as exc:
+        raise EvalError(
+            f"results were installed at {path} and are already visible, but "
+            f"removing the staging file afterwards failed: {exc}; do not "
+            f"retry as though nothing was committed"
+        ) from exc
 
 
 def _write_results_locked(
@@ -428,6 +458,7 @@ def _write_results_locked(
     fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".")
     tmp = Path(tmp_path)
     fd_owned = True
+    installed_cleanup_error: EvalError | None = None
     try:
         fh = os.fdopen(fd, "w", encoding="utf-8")
         fd_owned = False
@@ -435,6 +466,12 @@ def _write_results_locked(
             json.dump(payload, fh, ensure_ascii=True, sort_keys=True, indent=2)
             fh.write("\n")
             fh.flush()
+            # CORE-003 (SRC-002:R003): apply the captured destination mode
+            # BEFORE the staged fsync, so the one fsync that precedes the
+            # install synchronizes the content AND the final inode metadata
+            # together. Applying it after the fsync left the permission
+            # change outside the durability guarantee.
+            _apply_destination_mode(fh.fileno(), existing_mode)
             # CORE-006: durably commit the staged payload before replace.
             try:
                 os.fsync(fh.fileno())
@@ -442,16 +479,27 @@ def _write_results_locked(
                 raise EvalError(
                     f"fsync failed for staged results {tmp}: {exc}"
                 ) from exc
-            _apply_destination_mode(fh.fileno(), existing_mode)
         if must_not_exist:
-            _commit_no_clobber(tmp, path)
+            try:
+                _commit_no_clobber(tmp, path)
+            except EvalError as exc:
+                if "installed at" not in str(exc) or "already visible" not in str(exc):
+                    raise
+                # W2-003 (SRC-002:R006): the destination IS installed; the
+                # failure was staging cleanup. The durability step below
+                # still runs for the namespace state that exists, and the
+                # post-install error surfaces only after it.
+                installed_cleanup_error = exc
         else:
             os.replace(tmp, path)
         # CORE-006 / R015: durably commit the rename so the directory entry
         # survives a crash between install and the next read. A failure there
         # is reported, never swallowed -- see _fsync_parent_directory, which
-        # also owns the platform check.
+        # also owns the platform check. W2-003: this runs even when the
+        # post-install cleanup above failed, because the destination exists.
         _fsync_parent_directory(path)
+        if installed_cleanup_error is not None:
+            raise installed_cleanup_error
     except BaseException:
         if fd_owned:
             try:
@@ -594,6 +642,16 @@ def evaluate_conformance(
     R019/PERF-004: ``cases_validated=True`` skips the duplicate
     ``validate_cases`` call when the caller already holds a validated
     snapshot.
+
+    PERF-003 (SRC-002:R010): the verdict stays exhaustive -- every case is
+    counted, bound-id and PASS-requirement checks unchanged -- but detailed
+    ``reasons`` are BOUNDED. Only the first
+    ``REASON_DETAIL_CAP`` case-specific reasons are retained, then one
+    deterministic summary line reports the omitted count, and a machine-
+    readable ``reasons_truncated`` flag exposes the cut. The shipped
+    corpus is below the cap, so its diagnostics are byte-identical; a
+    large failed corpus can no longer turn the failure path into
+    proportional memory and proportional stderr output.
     """
     loaded = load_results(
         results_path, cases, cases_validated=cases_validated
@@ -601,6 +659,7 @@ def evaluate_conformance(
     bound_id = loaded.get("contract_id")
     counts = {"PASS": 0, "FAIL": 0, "SKIP": 0, "NOT_RUN": 0}
     reasons: list[str] = []
+    omitted = 0
     if bound_id is None:
         reasons.append("no contract_id bound; results do not establish conformance")
     elif bound_id != active_contract_id:
@@ -612,14 +671,20 @@ def evaluate_conformance(
     for cid, record in results.items():
         counts[record["state"]] += 1
         if record["state"] in ("FAIL", "NOT_RUN"):
-            reasons.append(f"{cid}: {record['state']} not permitted for conformance")
+            if len(reasons) < REASON_DETAIL_CAP:
+                reasons.append(f"{cid}: {record['state']} not permitted for conformance")
+            else:
+                omitted += 1
             continue
         # PASS and SKIP must carry execution provenance (CORE-003).
         if not isinstance(record.get("execution_provenance"), dict):
-            reasons.append(
-                f"{cid}: {record['state']} without execution_provenance is "
-                "not behavioural evidence"
-            )
+            if len(reasons) < REASON_DETAIL_CAP:
+                reasons.append(
+                    f"{cid}: {record['state']} without execution_provenance is "
+                    "not behavioural evidence"
+                )
+            else:
+                omitted += 1
     # R014/W2-005: SKIP is documented as "deliberately not run", so a corpus
     # with zero PASS records is not behavioural evidence of anything.
     if counts["PASS"] == 0:
@@ -628,11 +693,15 @@ def evaluate_conformance(
             "deliberately-not-run, so conformance needs at least one executed "
             "PASS"
         )
+    if omitted:
+        reasons.append(f"... {omitted} additional case failures omitted")
     conformant = not reasons
     return {
         "counts": counts,
         "conformant": conformant,
         "reasons": reasons,
+        "reasons_truncated": omitted > 0,
+        "omitted_reasons": omitted,
         "bound_id": bound_id,
         "active_id": active_contract_id,
     }

@@ -265,7 +265,51 @@ def _scan_code_spans(line: str) -> list[tuple[int, int]]:
     the simple CommonMark case (no escaping, no nested backticks inside
     the run) -- sufficient for the comment/fence boundary check the
     validator needs.
+
+    PERF-001 (SRC-002:R008): the backtick runs are tokenized ONCE, and
+    each run's next same-length successor is found in ONE reverse pass
+    with a ``run_len -> next run index`` map. The previous algorithm
+    rescanned the remaining suffix text for every unmatched opener, so a
+    descending sequence of unique run lengths made the scan quadratic --
+    an ~321 KB line of unmatched runs cost seconds. The greedy walk below
+    emits spans in one left-to-right pass over the run list, identical
+    span semantics: opener at run i pairs with the next run of the same
+    length, then the scan resumes after it; an unmatched opener is plain
+    text and the walk advances one run.
     """
+    if "`" not in line:
+        return []
+    runs: list[tuple[int, int, int]] = []  # (start, end, run_len)
+    i = 0
+    n = len(line)
+    while i < n:
+        if line[i] != "`":
+            i += 1
+            continue
+        start = i
+        while i < n and line[i] == "`":
+            i += 1
+        runs.append((start, i, i - start))
+    # next_same[j] = index of the next run with the same length as run j,
+    # computed in one reverse pass so a length's last seen successor is
+    # always the nearest one to the right of j.
+    next_same: list[int] = [-1] * len(runs)
+    seen: dict[int, int] = {}
+    for j in range(len(runs) - 1, -1, -1):
+        next_same[j] = seen.get(runs[j][2], -1)
+        seen[runs[j][2]] = j
+    spans: list[tuple[int, int]] = []
+    j = 0
+    while j < len(runs):
+        k = next_same[j]
+        if k != -1:
+            spans.append((runs[j][0], runs[k][1]))
+            j = k + 1
+        else:
+            j += 1
+    return spans
+
+
     spans: list[tuple[int, int]] = []
     cursor = 0
     while cursor < len(line):
@@ -276,7 +320,6 @@ def _scan_code_spans(line: str) -> list[tuple[int, int]]:
         while cursor < len(line) and line[cursor] == "`":
             cursor += 1
         run_len = cursor - run_start
-        # find a closing run of the same length
         close_start = cursor
         while close_start < len(line):
             if line[close_start] != "`":
@@ -291,7 +334,6 @@ def _scan_code_spans(line: str) -> list[tuple[int, int]]:
                 break
             close_start = end
         else:
-            # No matching close -- this is plain text, keep scanning past.
             continue
     return spans
 
@@ -324,7 +366,18 @@ def _strip_html_comments_preserving_spans(
     inline code span was then read as a real comment opener, hiding the
     live headings and state fields that followed -- and re-scanned a
     shorter suffix per comment, which is quadratic in line length.
+
+    PERF-001 (SRC-002:R008): the common case gets a fast exit. When no
+    comment is being carried and the line contains no ``<!--`` opener,
+    there is nothing to strip and no span the elision logic needs: the
+    line is returned unchanged without the backtick-run scan. The
+    shipped contract documents contain zero comment openers, so this
+    removes the expensive disambiguation work from every ordinary line.
+    A line that DOES carry an opener (or a carried-over comment) still
+    takes the full parser below, unchanged.
     """
+    if not in_comment and _HTML_COMMENT_OPEN not in line:
+        return line, False
     # Bytes still inside a carried-over comment are comment content, not
     # inline text, so span discovery starts after that comment closes.
     # The offsets are rebased to absolute ONCE, here, and never again.
@@ -750,15 +803,38 @@ def _acquire_locks(targets: list[Path]) -> list:
     Accepts both original (possibly symlinked) paths and already-resolved
     paths.  Sorts by resolved form; the lock acquisition order is always
     the same for the same physical files regardless of symlink topology.
+
+    W2-002 (SRC-002:R005): the aggregate cleanup catches ``BaseException``,
+    not only ``SaitalkError``. A ``KeyboardInterrupt`` or ``SystemExit``
+    arriving during the second acquisition used to bypass the release of
+    already-held handles, so cleanup depended on CPython object
+    destruction: a host that catches and retains the cancellation (its
+    traceback keeps the handles alive) stayed locked and self-deadlocked
+    later work. Cleanup now releases every earlier handle in reverse order,
+    continues past release failures, and re-raises the PRIMARY exception
+    unchanged, so cancellation identity and contention semantics are
+    preserved.
     """
     ordered = sorted(targets, key=lambda t: str(t.resolve()))
     handles = []
     try:
         for target in ordered:
             handles.append(_acquire_lock(target))
-    except SaitalkError:
+    except BaseException as primary:
+        cleanup_failures: list[str] = []
         for fh in reversed(handles):
-            _release_lock(fh)
+            try:
+                _release_lock(fh)
+            except SaitalkError as exc:
+                cleanup_failures.append(str(exc))
+            except BaseException as exc:
+                cleanup_failures.append(f"{type(exc).__name__}: {exc}")
+        # The primary stays the controlling error; cleanup failures are
+        # attached as context, never allowed to replace it.
+        if cleanup_failures:
+            raise primary from SaitalkError(
+                "lock cleanup incomplete: " + "; ".join(cleanup_failures)
+            )
         raise
     return handles
 
@@ -966,6 +1042,15 @@ def refresh(contract_path: Path, conf_path: Path, skill_path: Path) -> str:
             for target, tmp in temps.items():
                 _replace_temp(target, tmp)
                 replaced.append(target)
+            # CORE-001 (SRC-002:R001): the final stability check runs INSIDE
+            # the rollback-protected region. A late logical-manifest retarget
+            # is detected here after the physical replacements, and this exit
+            # path must roll back every member this invocation replaced --
+            # otherwise refresh reports failure while leaving the captured
+            # physical package mutated. The pre-write check at the W2-001
+            # site above is unchanged and still catches the earlier window.
+            _assert_manifest_stable((contract_path, conf_path, skill_path), resolved_map)
+
         except BaseException as primary:
             # W2-002: any unsuccessful exit (including cancellation,
             # OSError, programming errors) restores exactly the targets
@@ -992,7 +1077,6 @@ def refresh(contract_path: Path, conf_path: Path, skill_path: Path) -> str:
                     tmp.unlink(missing_ok=True)
                 except OSError:
                     pass
-        _assert_manifest_stable((contract_path, conf_path, skill_path), resolved_map)
         return new_id
     finally:
         _release_locks(locks)
@@ -1224,6 +1308,15 @@ def _sorted_dir_entries(directory: Path) -> list[tuple[str, str, bool, bool]]:
     cached ``DirEntry`` instead of a fresh ``os.stat`` per entry, and only
     the names are retained rather than ``Path`` objects.
 
+    CORE-002 (SRC-002:R002): a symlink whose target cannot be resolved is
+    neither ``is_dir()`` nor ``is_file()`` -- both follow the link -- so a
+    dangling adapter entry would previously fall through the walker as
+    neither-file-nor-directory and silently vanish from the drift scan
+    while ``validate_package`` still reported PASS. The classification now
+    carries ``is_symlink()`` in ``is_dir=False, is_file=False`` pairs and
+    the walker refuses such entries by relative path instead of skipping
+    them. Valid symlinks classify through their targets as before.
+
     The sort key appends ``/`` to directory names so the order matches
     lexical order of the RELATIVE PATHS the caller will report: ``z.md``
     precedes ``z/a.md`` because ``.`` sorts before ``/``, while a plain
@@ -1234,14 +1327,22 @@ def _sorted_dir_entries(directory: Path) -> list[tuple[str, str, bool, bool]]:
             entries = []
             for entry in scan:
                 is_dir = entry.is_dir()
-                entries.append(
-                    (
-                        entry.name + "/" if is_dir else entry.name,
-                        entry.name,
-                        is_dir,
-                        False if is_dir else entry.is_file(),
-                    )
-                )
+                is_file = False if is_dir else entry.is_file()
+                if is_dir:
+                    entries.append((entry.name + "/", entry.name, True, False))
+                    continue
+                if is_file:
+                    entries.append((entry.name, entry.name, False, True))
+                    continue
+                if entry.is_symlink():
+                    # Exists by name, resolves to nothing: a refusal, not a
+                    # skip. Kept out of is_dir/is_file so the walker can tell
+                    # "unresolvable" from "unrelated regular file".
+                    entries.append((entry.name, entry.name, False, False))
+                    continue
+                # An ordinary non-directory, non-Markdown file (or socket
+                # etc.): retain as a non-adapter entry the walker ignores.
+                entries.append((entry.name, entry.name, False, False))
     except OSError as exc:
         raise SaitalkError(f"cannot inspect adapter directory {directory}: {exc}") from exc
     entries.sort(key=lambda item: item[0])
@@ -1307,7 +1408,19 @@ def _iter_md_files(transport_dir: Path):
                     0,
                 )
                 continue
-            if is_file and name.casefold().endswith(".md"):
+            if not is_file:
+                # CORE-002 (SRC-002:R002): an entry that is neither a
+                # resolvable directory nor a resolvable file but EXISTS by
+                # name is a dangling symlink -- refusing it, naming the
+                # relative path, is the point of the drift gate. An unrelated
+                # non-regular entry (socket, fifo) is not an adapter and is
+                # ignored as before.
+                if os.path.islink(entry_path):
+                    raise SaitalkError(
+                        f"adapter symlink does not resolve: {entry_path}"
+                    )
+                continue
+            if name.casefold().endswith(".md"):
                 yield entry_path
 
 
@@ -1484,6 +1597,65 @@ def _state_snapshot_unchanged(snapshot) -> bool:
     )
 
 
+def _capture_drift_snapshot(root: Path) -> dict:
+    """Capture the adapter state a drift scan certified (W2-001, SRC-002:R004).
+
+    Returns ``{"root": root, "present": bool, "entries": ...}`` where
+    *root* is the manifest root the snapshot came from (so a later
+    comparison can re-derive the same paths), ``present`` records whether
+    ``adapters/`` existed, and ``entries`` maps each validated ``.md``
+    file's POSIX-style relative path to ``((st_dev, st_ino), sha256)`` of
+    its RESOLVED target and bytes. Symlink referent identity makes a
+    retarget detectable even when the new target has identical content.
+    An absent ``adapters/`` snapshots as ``present=False`` with no entries,
+    which is the T-912 nothing-to-scan contract; a present-but-empty
+    directory snapshots as ``present=True`` with no entries, so creating
+    one during validation is detected.
+
+    Every filesystem failure is normalized to :class:`SaitalkError`: this
+    runs unlocked, so a mid-snapshot mutation must be a refusal, never a
+    false PASS.
+    """
+    transport_dir = root / "adapters"
+    try:
+        os.lstat(transport_dir)
+    except FileNotFoundError:
+        return {"root": root, "present": False, "entries": {}}
+    except OSError as exc:
+        raise SaitalkError(f"cannot inspect adapter path {transport_dir}: {exc}") from exc
+    entries: dict[str, tuple[tuple[int, int], str]] = {}
+    try:
+        for path in _iter_md_files(transport_dir):
+            target_stat = os.stat(path, follow_symlinks=True)
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            rel = str(path.relative_to(transport_dir)).replace(os.sep, "/")
+            entries[rel] = ((target_stat.st_dev, target_stat.st_ino), digest)
+    except OSError as exc:
+        raise SaitalkError(
+            f"cannot capture adapter snapshot under {transport_dir}: {exc}"
+        ) from exc
+    return {"root": root, "present": True, "entries": entries}
+
+
+def _drift_snapshot_unchanged(snapshot: dict) -> bool:
+    """Is the adapter tree still the state the drift scan certified?
+
+    Content-first like :func:`_state_snapshot_unchanged`: bytes decide,
+    metadata sharpens. Any added, removed or rewritten ``.md`` file, or a
+    symlink whose referent identity moved, changes the verdict. A tree that
+    became unreadable mid-validation is "changed", never an error, because
+    the caller turns that into the canonical refusal.
+    """
+    root = snapshot.get("root")
+    if root is None:
+        return False
+    try:
+        current = _capture_drift_snapshot(root)
+    except (SaitalkError, OSError):
+        return False
+    return current == snapshot
+
+
 def _validate_package(
     contract_path: Path,
     conf_path: Path,
@@ -1546,6 +1718,16 @@ def validate_package(
     R003/CORE-003: the bound state's freshness is re-checked inside phase
     3, after the manifest checks and immediately before the successful
     return, so a mutation during phase 3's own I/O cannot slip through.
+
+    W2-001 (SRC-002:R004): phase 2's drift scan runs unlocked, so the state
+    it certified could change before phase 3 confirmed the manifest.  The
+    adapter namespace is now captured as a snapshot beside the drift scan --
+    absent-vs-present, the entry namespace with symlink identity, and the
+    digest of every ``.md`` file actually validated -- and phase 3 requires
+    that snapshot unchanged before returning PASS.  An adapter added,
+    removed, retargeted or rewritten after the scan makes the package
+    re-validation refuse with a normalized error instead of certifying a
+    stale scan.
     """
     resolved = _resolved_manifest_map(contract_path, conf_path, skill_path)
     logical_root = _require_coherent_root(contract_path, conf_path, skill_path)
@@ -1574,6 +1756,7 @@ def validate_package(
     # Phase 2: drift and (snapshot) state validation without manifest lock.
     if state_snapshot is not None:
         validate_state_bytes(state_snapshot[1], contract_id)
+    drift_snapshot = _capture_drift_snapshot(logical_root)
     validate_drift(logical_root)
 
     if state_snapshot is not None and not _state_snapshot_unchanged(state_snapshot):
@@ -1592,6 +1775,11 @@ def validate_package(
                     "aborting to avoid a stale result"
                 )
         _assert_manifest_stable(logical, resolved)
+        if not _drift_snapshot_unchanged(drift_snapshot):
+            raise SaitalkError(
+                f"adapters changed during validation: {logical_root / 'adapters'} "
+                "identity diverged; re-run validate"
+            )
         if state_snapshot is not None and not _state_snapshot_unchanged(state_snapshot):
             raise SaitalkError(
                 "state changed during validation: "
