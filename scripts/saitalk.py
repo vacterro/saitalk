@@ -250,7 +250,6 @@ def normalize(text: str) -> str:
 # CORE-002: Fixed Markdown top-level-line filter
 # ---------------------------------------------------------------------------
 
-_INLINE_CODE_RUN = re.compile(r"`+")
 _HTML_COMMENT_OPEN = "<!--"
 _HTML_COMMENT_CLOSE = "-->"
 
@@ -308,43 +307,6 @@ def _scan_code_spans(line: str) -> list[tuple[int, int]]:
         else:
             j += 1
     return spans
-
-
-    spans: list[tuple[int, int]] = []
-    cursor = 0
-    while cursor < len(line):
-        if line[cursor] != "`":
-            cursor += 1
-            continue
-        run_start = cursor
-        while cursor < len(line) and line[cursor] == "`":
-            cursor += 1
-        run_len = cursor - run_start
-        close_start = cursor
-        while close_start < len(line):
-            if line[close_start] != "`":
-                close_start += 1
-                continue
-            end = close_start
-            while end < len(line) and line[end] == "`":
-                end += 1
-            if end - close_start == run_len:
-                spans.append((run_start, end))
-                cursor = end
-                break
-            close_start = end
-        else:
-            continue
-    return spans
-
-
-def _in_code_span(offset: int, spans: list[tuple[int, int]]) -> bool:
-    for start, end in spans:
-        if start <= offset < end:
-            return True
-        if offset < start:
-            return False
-    return False
 
 
 def _strip_html_comments_preserving_spans(

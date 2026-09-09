@@ -5241,5 +5241,79 @@ class AuditSrc001RegressionTests(unittest.TestCase):
             released.clear()
 
 
+class T919DeadCodeStructureTests(unittest.TestCase):
+    """T-919: the PERF-001 lexer rewrite left dead residue that must stay
+    deleted -- _in_code_span, _INLINE_CODE_RUN, and the unreachable legacy
+    scanner body after _scan_code_spans's terminal return.
+
+    This is an AST / structural guard, not a string search: it walks the
+    compiled module and asserts the intended shape directly so a future edit
+    cannot silently restore the dead code.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        import ast
+
+        cls.ast = ast
+        cls.module_path = REPO / "scripts" / "saitalk.py"
+        cls.source = cls.module_path.read_text(encoding="utf-8")
+        cls.tree = ast.parse(cls.source, filename=str(cls.module_path))
+        cls.top_level = {
+            n.name
+            for n in cls.tree.body
+            if isinstance(
+                n,
+                (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
+            )
+        }
+
+    def _find(self, name: str) -> ast.FunctionDef | None:
+        ast = self.ast
+        for n in self.tree.body:
+            if isinstance(n, ast.FunctionDef) and n.name == name:
+                return n
+        return None
+
+    def test_in_code_span_is_gone(self) -> None:
+        self.assertNotIn("_in_code_span", self.top_level)
+
+    def test_inline_code_run_constant_is_gone(self) -> None:
+        self.assertNotIn("_INLINE_CODE_RUN", self.top_level)
+
+    def test_scan_code_spans_has_no_unreachable_body(self) -> None:
+        ast = self.ast
+        fn = self._find("_scan_code_spans")
+        self.assertIsNotNone(fn)
+        terminal = fn.body[-1]
+        self.assertIsInstance(
+            terminal, ast.Return, "_scan_code_spans must end in a return"
+        )
+        last_return = next(
+            (i for i, s in enumerate(fn.body) if isinstance(s, ast.Return)),
+            None,
+        )
+        assert last_return is not None
+        after = fn.body[last_return + 1:]
+        self.assertEqual(
+            after,
+            [],
+            "_scan_code_spans must have no statements after its terminal return",
+        )
+
+    def test_scan_code_spans_is_followed_by_strip_html(self) -> None:
+        ast = self.ast
+        idx = next(
+            i
+            for i, n in enumerate(self.tree.body)
+            if isinstance(n, ast.FunctionDef) and n.name == "_scan_code_spans"
+        )
+        nxt = self.tree.body[idx + 1]
+        self.assertIsInstance(nxt, ast.FunctionDef)
+        self.assertEqual(
+            nxt.name, "_strip_html_comments_preserving_spans"
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
