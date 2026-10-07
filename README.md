@@ -1,19 +1,21 @@
+<div align="center">
+
 # SAITALK
 
-SAITALK is a portable response-behavior protocol for humans and AI agents.
+**Portable, testable response-behavior rules for AI agents and chat systems.**
 
-Every conforming distribution includes the mandatory `caveman-ded` voice.
-English is the default chat language via `reply_language=en`.
+[![Version](https://img.shields.io/badge/version-0.1.9-D4B86A?style=flat-square)](VERSION)
+![Runtime](https://img.shields.io/badge/runtime-text%20instructions-6B5A2B?style=flat-square)
+![Vendor](https://img.shields.io/badge/vendor-neutral-332E22?style=flat-square)
+[![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 
-It is not tied to SAIPEN, a plugin manager, an IDE, a vendor, or one model.
-Anything that can load text instructions can use it.
+[**Use in any chat**](#use-in-any-chat) · [Configuration](#voice-and-language-are-separate) · [Tests](#run-tests) · [Evals](#run-the-eval-harness)
 
-The problem is simple: capable models still waste work by opposing valid
-requests, inventing review findings, rewriting correct text, drifting from the
-requested voice, changing language because pasted material confused them, and
-burying the answer under process theatre.
+</div>
 
-SAITALK makes those failures explicit, portable, configurable, and testable.
+SAITALK separates **how an agent should behave** from any one model, IDE, plugin manager, or orchestration stack. Its contract is plain text, configurable, and mechanically validated.
+
+The package makes common response failures explicit: unnecessary opposition to valid requests, invented review findings, needless rewriting, language drift, voice drift, and process-heavy filler.
 
 ## Package
 
