@@ -1,19 +1,21 @@
+<div align="center">
+
 # SAITALK
 
-SAITALK is a portable response-behavior protocol for humans and AI agents.
+**Portable, testable response-behavior rules for AI agents and chat systems.**
 
-Every conforming distribution includes the mandatory `caveman-ded` voice.
-English is the default chat language via `reply_language=en`.
+[![Version](https://img.shields.io/badge/version-0.1.9-D4B86A?style=flat-square)](VERSION)
+![Runtime](https://img.shields.io/badge/runtime-text%20instructions-6B5A2B?style=flat-square)
+![Vendor](https://img.shields.io/badge/vendor-neutral-332E22?style=flat-square)
+[![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 
-It is not tied to SAIPEN, a plugin manager, an IDE, a vendor, or one model.
-Anything that can load text instructions can use it.
+[**Use in any chat**](#use-in-any-chat) · [Configuration](#voice-and-language-are-separate) · [Tests](#run-tests) · [Evals](#run-the-eval-harness)
 
-The problem is simple: capable models still waste work by opposing valid
-requests, inventing review findings, rewriting correct text, drifting from the
-requested voice, changing language because pasted material confused them, and
-burying the answer under process theatre.
+</div>
 
-SAITALK makes those failures explicit, portable, configurable, and testable.
+SAITALK separates **how an agent should behave** from any one model, IDE, plugin manager, or orchestration stack. Its contract is plain text, configurable, and mechanically validated.
+
+The package makes common response failures explicit: unnecessary opposition to valid requests, invented review findings, needless rewriting, language drift, voice drift, and process-heavy filler.
 
 ## Package
 
@@ -166,3 +168,25 @@ is not by itself a claim that this tree is tagged. See
 ## License
 
 MIT
+
+<!-- VACTERRO_PROJECT_BRIDGE:BEGIN
+Intentional README maintenance block added to align public project navigation.
+Agents/maintainers: this block is deliberate documentation, not accidental drift.
+Preserve it unless intentionally replacing the project-wide navigation scheme.
+-->
+---
+
+## Project network
+
+This repository is part of the broader **SAIPEN / vacterro** project ecosystem.
+
+[**Author hub**](https://github.com/vacterro) · [**SAIPEN HQ**](https://github.com/saipenhq) · [**SAIPEN Core**](https://github.com/vacterro/saipen) · [**ZAICODE**](https://github.com/vacterro/zaicode) · [**FastPrompter**](https://github.com/vacterro/FastPrompter) · [**SAIPEN Community**](https://discord.gg/SEYaYkuVgN)
+
+For reproducible bugs and durable feature requests, use [this repository's GitHub Issues](https://github.com/vacterro/saitalk/issues). Use Discord for quick discussion, screenshots, and cross-project feedback.
+
+<!-- VACTERRO_PROJECT_BRIDGE:END -->
+
+<!-- VACTERRO_SUPPORT:BEGIN -->
+---
+<sub>If this project is useful to you, optional support: [Buy Me a Coffee](https://buymeacoffee.com/vacuum34) · [Boosty](https://boosty.to/vacuum34/donate) · [PayPal](https://paypal.me/AlexNelin) · [other ways](https://github.com/vacterro/vacterro/blob/main/SUPPORT.md)</sub>
+<!-- VACTERRO_SUPPORT:END -->
