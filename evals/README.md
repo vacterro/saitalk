@@ -100,7 +100,11 @@ exactly these five keys, each a non-empty string, and nothing else:
 | `host` | the host/tool that executed the prompt |
 | `model` | the model that answered |
 | `runner` | the script or harness that drove the run |
-| `response_digest` | digest of the recorded model response |
+| `response_digest` | SHA-256 of the recorded model response, as exactly 64 lowercase hexadecimal characters |
+
+The format is syntax/integrity metadata only: it proves the field has the
+documented digest shape, not that any particular runner produced the
+response.
 
 The file also records the `contract_id` it was produced under and the eval
 corpus `version`, case count, and deterministic `digest`. A results file

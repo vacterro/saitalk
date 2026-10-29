@@ -36,10 +36,30 @@ RESULTS_ROOT_KEYS = frozenset({"version", "schema", "contract_id", "corpus", "re
 REASON_DETAIL_CAP = 75
 RESULTS_CORPUS_KEYS = frozenset({"version", "cases", "digest"})
 CONTRACT_ID_RE = re.compile(r"^saitalk-[0-9a-f]{16}$")
+# SRC-003:R006: response_digest is documented as a digest of the recorded
+# model response; the documented example is 64 hex characters. This is the ONE
+# canonical syntax validator -- write_results, load_results and
+# evaluate_conformance all reach it through validate_results.
+RESPONSE_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 class EvalError(ValueError):
     pass
+
+
+class PostCommitError(EvalError):
+    """The destination was already installed before the failure arrived.
+
+    SRC-003:R005: a KeyboardInterrupt/SystemExit (or any non-EvalError)
+    raised after ``os.link``/``os.replace`` committed the destination must
+    not masquerade as a pre-commit cancellation -- a caller could otherwise
+    retry and either collide with the existing file (no-clobber) or blindly
+    overwrite the committed snapshot. This class says plainly: installed,
+    already visible, do not retry as though nothing was committed. The
+    original exception is chained as ``__cause__`` so cancellation identity
+    is preserved.
+    """
+
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -296,6 +316,18 @@ def validate_results(
                         f"case {cid}: execution_provenance.{key} must be a "
                         f"non-empty string"
                     )
+            # SRC-003:R006 (W2-002): the field is named and documented as a
+            # digest, so the validator must enforce its own field-level
+            # invariant. SHA-256 hex is the documented algorithm; 64 lowercase
+            # hexadecimal characters. Syntax/integrity metadata only -- this
+            # never claims runner authenticity.
+            digest = prov.get("response_digest")
+            if not RESPONSE_DIGEST_RE.fullmatch(digest):
+                raise EvalError(
+                    f"case {cid}: execution_provenance.response_digest must be "
+                    f"64 lowercase hexadecimal characters (sha256 hex), found "
+                    f"{digest!r}"
+                )
 
 
 def _capture_destination_mode(path: Path) -> int | None:
@@ -430,6 +462,7 @@ def _write_results_locked(
     contract_id: str | None = None,
     *,
     must_not_exist: bool = False,
+    corpus: dict[str, Any] | None = None,
 ) -> None:
     """Stage, durably commit and atomically install one results document.
 
@@ -440,16 +473,26 @@ def _write_results_locked(
     closes the check-then-replace window in which a file created between
     ``exists()`` and the commit was destroyed by the command documented as
     non-destructive.
+
+    *corpus* (SRC-003:R007) is the pre-computed corpus binding
+    ``{"version", "cases", "digest"}``. When supplied it is used verbatim
+    instead of hashing *cases* again, so the expensive digest never runs
+    while the destination lock is held. The caller must derive it from its
+    already-validated snapshot; the ``corpus_digest`` bytes are unchanged.
     """
     payload = {
         "version": 1,
         "schema": "saitalk-eval-results",
         "contract_id": contract_id,
-        "corpus": {
-            "version": cases["version"],
-            "cases": len(cases["cases"]),
-            "digest": corpus_digest(cases),
-        },
+        "corpus": (
+            corpus
+            if corpus is not None
+            else {
+                "version": cases["version"],
+                "cases": len(cases["cases"]),
+                "digest": corpus_digest(cases),
+            }
+        ),
         "results": results,
     }
     if path.is_symlink():
@@ -459,6 +502,11 @@ def _write_results_locked(
     tmp = Path(tmp_path)
     fd_owned = True
     installed_cleanup_error: EvalError | None = None
+    # SRC-003:R005: False until the destination is proven to exist. Declared
+    # before the try so the post-commit classification can read it on any
+    # exit path.
+    installed = False
+    candidate_identity = None
     try:
         fh = os.fdopen(fd, "w", encoding="utf-8")
         fd_owned = False
@@ -479,6 +527,7 @@ def _write_results_locked(
                 raise EvalError(
                     f"fsync failed for staged results {tmp}: {exc}"
                 ) from exc
+            candidate_identity = os.fstat(fh.fileno())
         if must_not_exist:
             try:
                 _commit_no_clobber(tmp, path)
@@ -492,15 +541,59 @@ def _write_results_locked(
                 installed_cleanup_error = exc
         else:
             os.replace(tmp, path)
+        # Successful installation returned; exception paths below also check
+        # the staged file identity because cancellation can arrive immediately
+        # after the filesystem commit, before this assignment executes.
+        installed = path.exists() or installed_cleanup_error is not None
         # CORE-006 / R015: durably commit the rename so the directory entry
         # survives a crash between install and the next read. A failure there
         # is reported, never swallowed -- see _fsync_parent_directory, which
         # also owns the platform check. W2-003: this runs even when the
         # post-install cleanup above failed, because the destination exists.
-        _fsync_parent_directory(path)
+        try:
+            _fsync_parent_directory(path)
+        except BaseException as exc:
+            if installed and not isinstance(exc, EvalError):
+                # A cancellation here is NOT a pre-commit cancellation: the
+                # results are installed and already visible, only their crash
+                # durability is unknown.
+                raise PostCommitError(
+                    f"results were installed at {path} and are already "
+                    f"visible, but the run was interrupted before the "
+                    f"commit could be made crash-durable: {exc!r}; do not "
+                    f"retry as though nothing was committed"
+                ) from exc
+            raise
         if installed_cleanup_error is not None:
             raise installed_cleanup_error
-    except BaseException:
+    except BaseException as exc:
+        if not installed and candidate_identity is not None:
+            try:
+                installed = os.path.samestat(candidate_identity, path.lstat())
+            except OSError:
+                pass
+        # SRC-003:R005: any non-EvalError escaping after the install point is
+        # a POST-COMMIT failure, never an indistinguishable pre-commit
+        # cancellation. EvalError diagnostics keep their existing wording.
+        if (
+            installed
+            and not isinstance(exc, EvalError)
+            and not isinstance(exc, PostCommitError)
+        ):
+            if fd_owned:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise PostCommitError(
+                f"results were installed at {path} and are already visible, "
+                f"but the run was interrupted afterwards: {exc!r}; do not "
+                f"retry as though nothing was committed"
+            ) from exc
         if fd_owned:
             try:
                 os.close(fd)
@@ -547,6 +640,18 @@ def write_results(
         raise EvalError(
             "recorded results (states other than NOT_RUN) must bind a contract_id"
         )
+    # SRC-003:R007: compute the immutable corpus binding from the VALIDATED
+    # snapshot BEFORE the destination lock. The digest is pure CPU over bytes
+    # that are independent of destination state; hashing it inside the lock
+    # enlarged the window in which an otherwise valid concurrent caller is
+    # rejected by the deliberately non-blocking lock. Snapshot semantics
+    # (CORE-005) are preserved: the binding comes from snapshot_cases, never
+    # from the caller's live mutable objects. Digest bytes are unchanged.
+    corpus = {
+        "version": snapshot_cases["version"],
+        "cases": len(snapshot_cases["cases"]),
+        "digest": corpus_digest(snapshot_cases),
+    }
     with _destination_lock(path):
         _write_results_locked(
             snapshot_results,
@@ -554,6 +659,7 @@ def write_results(
             snapshot_cases,
             contract_id,
             must_not_exist=must_not_exist,
+            corpus=corpus,
         )
 
 
@@ -814,10 +920,16 @@ def main() -> int:
                         recorded = any(
                             r["state"] != "NOT_RUN" for r in existing["results"].values()
                         )
+                        # SRC-003:R007: the corpus digest comparison already
+                        # happened inside load_results -- it rejects a file
+                        # bound to a different digest outright. Re-hashing the
+                        # whole corpus here duplicated that exact invariant
+                        # while holding the destination lock. Equivalence of
+                        # the results payload plus load_results' binding
+                        # checks are the remaining no-op conditions.
                         if (
                             not recorded
                             and existing["results"] == results
-                            and existing.get("corpus", {}).get("digest") == corpus_digest(data)
                         ):
                             print(f"EVALS RESULTS: {out} (already initialized, no-op)")
                             return 0

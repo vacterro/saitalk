@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import pathlib
 import re
 import shutil
 import subprocess
@@ -4290,6 +4291,122 @@ class AuditSrc001RegressionTests(unittest.TestCase):
             doc = json.loads(out.read_text(encoding="utf-8"))
             self.assertEqual(doc["schema"], "saitalk-eval-results")
 
+    # ---- SRC-003:R005: post-commit cancellation boundary ----------------
+
+    def test_cancel_after_install_is_classified_post_commit(self) -> None:
+        # must_not_exist=True: a cancellation landing after the install and
+        # before the parent fsync must say POST-COMMIT, not look like an
+        # ordinary pre-commit cancellation.
+        harness = self.evals_harness
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp) / "results.json"
+            results = harness.new_results(self.cases)
+
+            def cancel_after_install(path):
+                raise KeyboardInterrupt("cancel after install")
+
+            with unittest.mock.patch.object(harness, "Path", pathlib.WindowsPath):
+                with unittest.mock.patch.object(harness.os, "name", "posix"):
+                    with unittest.mock.patch.object(
+                        harness, "_fsync_parent_directory", cancel_after_install
+                    ):
+                        with self.assertRaises(harness.PostCommitError) as ctx:
+                            harness._write_results_locked(
+                                results, out, self.cases, contract_id=None,
+                                must_not_exist=True,
+                            )
+            message = str(ctx.exception)
+            self.assertIn("already visible", message)
+            self.assertIn("do not retry", message)
+            self.assertTrue(out.exists())
+            # Cancellation identity is preserved through __cause__.
+            self.assertIsInstance(ctx.exception.__cause__, KeyboardInterrupt)
+
+    def test_cancel_after_install_force_replace_same_classification(self) -> None:
+        # Same boundary, force/default os.replace path.
+        harness = self.evals_harness
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp) / "results.json"
+            results = harness.new_results(self.cases)
+
+            def cancel_after_install(path):
+                raise SystemExit("cancel after install")
+
+            with unittest.mock.patch.object(harness, "Path", pathlib.WindowsPath):
+                with unittest.mock.patch.object(
+                    harness, "_fsync_parent_directory", cancel_after_install
+                ):
+                    with self.assertRaises(harness.PostCommitError) as ctx:
+                        harness._write_results_locked(
+                            results, out, self.cases, contract_id=None
+                        )
+            self.assertIn("already visible", str(ctx.exception))
+            self.assertIsInstance(ctx.exception.__cause__, SystemExit)
+            self.assertTrue(out.exists())
+
+    def test_pre_install_cancellation_creates_no_destination(self) -> None:
+        # A cancellation BEFORE the install remains a plain cancellation and
+        # leaves no destination this call created.
+        harness = self.evals_harness
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp) / "results.json"
+            results = harness.new_results(self.cases)
+
+            def cancel_before_install(src, dst):
+                raise KeyboardInterrupt("cancel before install")
+
+            with unittest.mock.patch.object(harness, "Path", pathlib.WindowsPath):
+                with unittest.mock.patch.object(harness.os, "name", "posix"):
+                    with unittest.mock.patch.object(
+                        harness.os, "replace", side_effect=cancel_before_install
+                    ):
+                        with self.assertRaises(KeyboardInterrupt):
+                            harness._write_results_locked(
+                                results, out, self.cases, contract_id=None
+                            )
+            self.assertFalse(out.exists())
+
+    def test_ordinary_dir_fsync_failure_keeps_its_diagnostic(self) -> None:
+        # An EvalError from the directory fsync keeps its existing
+        # durability-uncertain wording and is not re-wrapped.
+        harness = self.evals_harness
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp) / "results.json"
+            results = harness.new_results(self.cases)
+
+            def fsync_fails(path):
+                raise harness.EvalError(
+                    f"commit durability uncertain for {path}: the results were "
+                    "installed and are already visible, but the directory fsync "
+                    "that makes the rename crash-durable failed: boom"
+                )
+
+            with unittest.mock.patch.object(harness, "Path", pathlib.WindowsPath):
+                with unittest.mock.patch.object(harness.os, "name", "posix"):
+                    with unittest.mock.patch.object(
+                        harness, "_fsync_parent_directory", fsync_fails
+                    ):
+                        with self.assertRaises(harness.EvalError) as ctx:
+                            harness._write_results_locked(
+                                results, out, self.cases, contract_id=None,
+                                must_not_exist=True,
+                            )
+            self.assertNotIsInstance(ctx.exception, harness.PostCommitError)
+            self.assertIn("durability uncertain", str(ctx.exception))
+            self.assertIn("already visible", str(ctx.exception))
+
+    def test_successful_write_round_trips(self) -> None:
+        # Ordinary success is unchanged and round-trips through load_results.
+        harness = self.evals_harness
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp) / "results.json"
+            results = harness.new_results(self.cases)
+            for case in self.cases["cases"]:
+                results[case["id"]] = {"state": "NOT_RUN"}
+            harness.write_results(results, out, self.cases, contract_id=None)
+            back = harness.load_results(out, self.cases)
+            self.assertEqual(back["schema"], "saitalk-eval-results")
+
     # ---- SRC-002 W2-004: results schema has no undocumented run key ----
 
     def test_loader_rejects_a_top_level_run_key(self) -> None:
@@ -5241,6 +5358,285 @@ class AuditSrc001RegressionTests(unittest.TestCase):
             released.clear()
 
 
+class T923R001RefreshContentStabilityTests(unittest.TestCase):
+    """SRC-003:R001 (audit/3.md CORE-001): refresh must not report success
+    when a concurrent editor has mutated any manifest member after the
+    authoritative byte snapshot.  The post-write guard checks exact bytes,
+    not merely referent identity.
+    """
+
+    def _make_pkg(self, root: Path) -> tuple[Path, Path, Path]:
+        contract = root / "SAITALK.md"
+        conf = root / "saitalk.conf"
+        skill = root / "SKILL.md"
+        contract.write_text(make_contract_text(), encoding="utf-8")
+        conf.write_text(CONF_FMT.format(reply="en", style="caveman-ded"), encoding="utf-8")
+        skill.write_text(
+            "# SKILL\n\nSAITALK.md owns all normative behavior.\n", encoding="utf-8"
+        )
+        return contract, conf, skill
+
+    def test_normal_refresh_still_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            contract, conf, skill = self._make_pkg(root)
+            rid = saitalk.refresh(contract, conf, skill)
+            cid, _ = saitalk.validate_package(contract, conf, skill)
+            self.assertEqual(cid, rid)
+
+    def test_skill_md_mutated_after_install_is_detected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            contract, conf, skill = self._make_pkg(root)
+            skill_snapshot = skill.read_bytes()
+
+            real_replace = saitalk._replace_temp
+
+            def replace_then_mutate(target, tmp):
+                real_replace(target, tmp)
+                skill.write_bytes(skill_snapshot + b"\n<!-- injected -->\n")
+
+            with unittest.mock.patch.object(
+                saitalk, "_replace_temp", side_effect=replace_then_mutate
+            ):
+                with self.assertRaises(saitalk.SaitalkError) as ctx:
+                    saitalk.refresh(contract, conf, skill)
+            self.assertIn("modified concurrently", str(ctx.exception))
+
+    def test_contract_mutated_after_install_is_detected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            contract, conf, skill = self._make_pkg(root)
+            real_replace = saitalk._replace_temp
+            replaced_count = [0]
+
+            def replace_then_mutate(target, tmp):
+                real_replace(target, tmp)
+                replaced_count[0] += 1
+                if replaced_count[0] == 1:
+                    contract.write_text(
+                        contract.read_text(encoding="utf-8") + "\n<!-- extra -->\n",
+                        encoding="utf-8",
+                    )
+
+            with unittest.mock.patch.object(
+                saitalk, "_replace_temp", side_effect=replace_then_mutate
+            ):
+                with self.assertRaises(saitalk.SaitalkError) as ctx:
+                    saitalk.refresh(contract, conf, skill)
+            self.assertIn("modified concurrently", str(ctx.exception))
+
+    def test_no_concurrent_mutation_no_error(self) -> None:
+        # No concurrent mutation: refresh writes normally, no gate fires, and
+        # validate passes immediately after.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            contract, conf, skill = self._make_pkg(root)
+            before_contract = contract.read_bytes()
+            before_skill = skill.read_bytes()
+            rid = saitalk.refresh(contract, conf, skill)
+            after_contract = contract.read_bytes()
+            after_skill = skill.read_bytes()
+            self.assertNotEqual(before_contract, after_contract)
+            self.assertEqual(before_skill, after_skill)
+            cid, _ = saitalk.validate_package(contract, conf, skill)
+            self.assertEqual(cid, rid)
+
+    def test_third_party_mutation_not_clobbered_by_rollback(self) -> None:
+        # When the concurrent edit lands on a member refresh already replaced,
+        # the rollback must not blindly restore the pre-refresh bytes.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            contract, conf, skill = self._make_pkg(root)
+            real_replace = saitalk._replace_temp
+
+            def replace_then_mutate(target, tmp):
+                real_replace(target, tmp)
+                if target.name == "SAITALK.md":
+                    # Inject the concurrent edit AFTER refresh's replacement.
+                    contract.write_text(
+                        contract.read_text(encoding="utf-8") + "\n<!-- third-party -->\n",
+                        encoding="utf-8",
+                    )
+
+            with unittest.mock.patch.object(
+                saitalk, "_replace_temp", side_effect=replace_then_mutate
+            ):
+                with self.assertRaises(saitalk.SaitalkError) as ctx:
+                    saitalk.refresh(contract, conf, skill)
+            self.assertIn("modified concurrently", str(ctx.exception))
+            # The third-party content must survive (not be clobbered by a
+            # blind rollback that restored the pre-refresh bytes).
+            self.assertIn("<!-- third-party -->", contract.read_text(encoding="utf-8"))
+
+
+class T923R006ResponseDigestTests(unittest.TestCase):
+    """SRC-003:R006: response_digest accepts only documented SHA-256 hex."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        from evals import harness
+
+        cls.harness = harness
+        cls.cases = harness.load_cases(REPO / "evals" / "cases.json")
+
+    def _results(self, digest: str) -> dict[str, dict[str, object]]:
+        results = self.harness.new_results(self.cases)
+        results[self.cases["cases"][0]["id"]] = {
+            "state": "PASS",
+            "execution_provenance": {
+                "run_id": "run",
+                "host": "host",
+                "model": "model",
+                "runner": "runner",
+                "response_digest": digest,
+            },
+        }
+        return results
+
+    def test_valid_lowercase_sha256_hex_is_accepted(self) -> None:
+        self.harness.validate_results(
+            self._results("a" * 64), self.cases
+        )
+
+    def test_malformed_digest_is_rejected(self) -> None:
+        for digest in ("", "not-a-digest", "a" * 63, "a" * 65,
+                       "g" * 64, "A" * 64, "sha256:" + "a" * 64):
+            with self.subTest(digest=digest):
+                with self.assertRaises(self.harness.EvalError):
+                    self.harness.validate_results(self._results(digest), self.cases)
+
+    def test_write_and_load_share_same_digest_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp) / "results.json"
+            with self.assertRaises(self.harness.EvalError):
+                self.harness.write_results(
+                    self._results("not-a-digest"), out, self.cases,
+                    contract_id="saitalk-0000000000000000",
+                )
+            self.assertFalse(out.exists())
+
+
+class T923R007CorpusDigestOutsideLockTests(unittest.TestCase):
+    """SRC-003:R007: corpus binding is computed once, outside the destination
+    lock, and init-results does not re-hash what load_results verified.
+
+    These are ORDERING gates, not timing gates: they instrument the call
+    sequence so a regression that moves the digest back inside the critical
+    section (or restores the duplicate hash) fails deterministically.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        import contextlib
+
+        cls.contextlib = contextlib
+        from evals import harness
+
+        cls.harness = harness
+        cls.cases = harness.load_cases(REPO / "evals" / "cases.json")
+
+    def test_corpus_digest_runs_before_the_destination_lock(self) -> None:
+        events: list[str] = []
+        real_digest = self.harness.corpus_digest
+
+        def watching_digest(data):
+            events.append("digest")
+            return real_digest(data)
+
+        real_lock = self.harness._destination_lock
+        contextlib = self.contextlib
+
+        @contextlib.contextmanager
+        def watching_lock(path):
+            events.append("lock_enter")
+            try:
+                with real_lock(path):
+                    yield
+            finally:
+                events.append("lock_exit")
+
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp) / "results.json"
+            results = self.harness.new_results(self.cases)
+            with unittest.mock.patch.object(
+                self.harness, "corpus_digest", side_effect=watching_digest
+            ):
+                with unittest.mock.patch.object(
+                    self.harness, "_destination_lock", watching_lock
+                ):
+                    self.harness.write_results(
+                        results, out, self.cases, contract_id=None
+                    )
+        self.assertIn("digest", events)
+        self.assertIn("lock_enter", events)
+        self.assertLess(events.index("digest"), events.index("lock_enter"))
+
+    def test_digest_computed_exactly_once_per_write(self) -> None:
+        calls: list[int] = []
+        real_digest = self.harness.corpus_digest
+
+        def counting_digest(data):
+            calls.append(1)
+            return real_digest(data)
+
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp) / "results.json"
+            results = self.harness.new_results(self.cases)
+            with unittest.mock.patch.object(
+                self.harness, "corpus_digest", side_effect=counting_digest
+            ):
+                self.harness.write_results(results, out, self.cases, contract_id=None)
+        self.assertEqual(len(calls), 1)
+
+    def test_init_results_noop_does_not_rehash_the_corpus(self) -> None:
+        # A second init-results over an already-initialized, unrecorded file
+        # verifies the binding exactly once in load_results, without a second
+        # redundant hash in the no-op branch.
+        calls: list[int] = []
+        real_digest = self.harness.corpus_digest
+
+        def counting_digest(data):
+            calls.append(1)
+            return real_digest(data)
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            cases_path = root / "cases.json"
+            cases_path.write_text(
+                json.dumps(self.cases), encoding="utf-8"
+            )
+            out = root / "results.json"
+            argv = [
+                "harness", "init-results",
+                "--cases", str(cases_path),
+                "--out", str(out),
+            ]
+            with unittest.mock.patch.object(sys, "argv", argv):
+                self.assertEqual(self.harness.main(), 0)
+            calls.clear()
+            with unittest.mock.patch.object(
+                self.harness, "corpus_digest", side_effect=counting_digest
+            ):
+                with unittest.mock.patch.object(sys, "argv", argv):
+                    self.assertEqual(self.harness.main(), 0)
+        # load_results verifies the binding; the writer must not re-hash.
+        self.assertEqual(len(calls), 1)
+
+    def test_corpus_digest_bytes_are_unchanged(self) -> None:
+        # The binding is passed through, never recomputed differently.
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp) / "results.json"
+            results = self.harness.new_results(self.cases)
+            self.harness.write_results(results, out, self.cases, contract_id=None)
+            doc = json.loads(out.read_text(encoding="utf-8"))
+            self.assertEqual(
+                doc["corpus"]["digest"], self.harness.corpus_digest(self.cases)
+            )
+            self.assertEqual(doc["corpus"]["cases"], len(self.cases["cases"]))
+            self.assertEqual(doc["corpus"]["version"], self.cases["version"])
+
+
 class T919DeadCodeStructureTests(unittest.TestCase):
     """T-919: the PERF-001 lexer rewrite left dead residue that must stay
     deleted -- _in_code_span, _INLINE_CODE_RUN, and the unreachable legacy
@@ -5313,6 +5709,48 @@ class T919DeadCodeStructureTests(unittest.TestCase):
         self.assertEqual(
             nxt.name, "_strip_html_comments_preserving_spans"
         )
+
+
+class InstallCancellationIdentityTests(unittest.TestCase):
+    """A syscall can install the candidate and then deliver cancellation."""
+
+    def test_cancellation_during_install_is_classified_by_file_identity(self):
+        from evals import harness
+        cases = harness.load_cases(REPO / "evals/cases.json")
+        for mode in ("replace", "no-clobber"):
+            for preexisting in (False, True):
+                if mode == "no-clobber" and preexisting:
+                    continue
+                with self.subTest(mode=mode, preexisting=preexisting), tempfile.TemporaryDirectory() as temp:
+                    out = Path(temp) / "results.json"
+                    if preexisting:
+                        out.write_bytes(b"older results")
+                    operation = "replace" if mode == "replace" else "rename"
+                    real = getattr(harness.os, operation)
+                    def commit_then_cancel(src, dst):
+                        real(src, dst)
+                        raise KeyboardInterrupt("signal after filesystem commit")
+                    caught = None
+                    with unittest.mock.patch.object(harness.os, operation, side_effect=commit_then_cancel):
+                        try:
+                            harness._write_results_locked(harness.new_results(cases), out, cases,
+                                                          must_not_exist=mode == "no-clobber")
+                        except BaseException as exc:
+                            caught = exc
+                    self.assertIsInstance(caught, harness.PostCommitError)
+                    self.assertIsInstance(caught.__cause__, KeyboardInterrupt)
+                    self.assertEqual(json.loads(out.read_text())["schema"], "saitalk-eval-results")
+
+    def test_preinstall_cancellation_preserves_existing_destination(self):
+        from evals import harness
+        cases = harness.load_cases(REPO / "evals/cases.json")
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp) / "results.json"
+            out.write_bytes(b"operator evidence")
+            with unittest.mock.patch.object(harness.os, "replace", side_effect=KeyboardInterrupt):
+                with self.assertRaises(KeyboardInterrupt):
+                    harness._write_results_locked(harness.new_results(cases), out, cases)
+            self.assertEqual(out.read_bytes(), b"operator evidence")
 
 
 if __name__ == "__main__":

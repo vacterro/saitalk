@@ -1012,16 +1012,43 @@ def refresh(contract_path: Path, conf_path: Path, skill_path: Path) -> str:
             # physical package mutated. The pre-write check at the W2-001
             # site above is unchanged and still catches the earlier window.
             _assert_manifest_stable((contract_path, conf_path, skill_path), resolved_map)
+            # SRC-003:R001: content-stability gate.  Expected bytes are the
+            # installed replacement for changed members and the original
+            # snapshot for unchanged ones (SKILL.md is never written here).
+            expected_bytes: dict[Path, bytes] = {
+                resolved_map['SAITALK.md']: new_contract,
+                resolved_map['saitalk.conf']: new_conf,
+                resolved_map['SKILL.md']: raw['SKILL.md'],
+            }
+            _assert_manifest_content_stable(resolved_map, expected_bytes)
 
         except BaseException as primary:
             # W2-002: any unsuccessful exit (including cancellation,
             # OSError, programming errors) restores exactly the targets
             # this invocation already replaced.
+            # SRC-003:R001: a replaced target is restored ONLY when its
+            # current bytes still equal the bytes this refresh installed.
+            # A concurrent editor that mutated the file after the install
+            # owns newer content -- clobbering it with the pre-refresh
+            # snapshot would silently destroy third-party work.
             rollback_failures: list[str] = []
             for target, _content, original in pairs:
                 if target not in replaced:
                     continue
                 try:
+                    installed_bytes = _content
+                    try:
+                        current = target.read_bytes()
+                    except OSError as exc:
+                        raise SaitalkError(
+                            f"cannot re-read {target} for rollback: {exc}"
+                        ) from exc
+                    if current != installed_bytes:
+                        raise SaitalkError(
+                            f"{target} was modified concurrently after the "
+                            "install; rollback refused to clobber newer "
+                            "content"
+                        )
                     _restore_bytes(target, original, mode=modes_map.get(target))
                 except SaitalkError as exc:
                     rollback_failures.append(f"{target}: {exc}")
@@ -1079,6 +1106,33 @@ def _assert_manifest_stable(
             raise SaitalkError(
                 f"manifest member {label} was retargeted during the operation; "
                 "aborting to avoid reporting a stale package"
+            )
+
+
+def _assert_manifest_content_stable(
+    resolved_map: dict[str, Path], expected: dict[Path, bytes]
+) -> None:
+    """SRC-003:R001: prove every manifest member still holds the exact bytes
+    this transaction expects, not merely the same referent.
+
+    ``_assert_manifest_stable`` answers "do the logical paths still point
+    where they did"; this gate answers "are those files still the bytes the
+    transaction validated/installed".  A concurrent editor can mutate
+    SAITALK.md, saitalk.conf or SKILL.md after the authoritative snapshot
+    without retargeting the path, so referent stability alone is not enough.
+    """
+    for label, path in resolved_map.items():
+        want = expected.get(path)
+        if want is None:
+            continue
+        try:
+            current = path.read_bytes()
+        except OSError as exc:
+            raise SaitalkError(f"cannot re-read {label}: {exc}") from exc
+        if current != want:
+            raise SaitalkError(
+                f"manifest member {label} was modified concurrently during "
+                "refresh; aborting to avoid reporting a stale package"
             )
 
 
