@@ -5725,7 +5725,8 @@ class InstallCancellationIdentityTests(unittest.TestCase):
                     out = Path(temp) / "results.json"
                     if preexisting:
                         out.write_bytes(b"older results")
-                    operation = "replace" if mode == "replace" else "rename"
+                    operation = ("replace" if mode == "replace" else
+                                 ("rename" if os.name == "nt" else "link"))
                     real = getattr(harness.os, operation)
                     def commit_then_cancel(src, dst):
                         real(src, dst)
